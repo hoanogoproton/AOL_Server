@@ -1,0 +1,47 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+
+storage:
+  base_dir: "D:/Project Demo/AI Detect AOL/data"
+  raw_dir: "D:/Project Demo/AI Detect AOL/data/raw"
+  annotated_dir: "D:/Project Demo/AI Detect AOL/data/annotated"
+  database_path: "D:/Project Demo/AI Detect AOL/data/inspection.db"
+
+model:
+  weights: "D:/Project Demo/AI Detect AOL/models/best1.pt"
+  device: cpu                 # GPU đầu tiên. Dùng "cpu" nếu không có GPU.
+  imgsz: 1280
+  min_predict_confidence: 0.4
+  iou_threshold: 0.45
+
+image:
+  expected_width: 1600
+  expected_height: 1200
+  reject_wrong_resolution: true
+
+roi:
+  csv_path: "D:/Project Demo/AI Detect AOL/roi_rules.csv"
+  bbox_rule: "center_inside_roi"
+
+sequence:
+  # Nếu Step 1 đã đến mà không có Step 3 sau thời gian này:
+  # server sẽ kết luận NG để fail-safe.
+  server_cycle_timeout_sec: 120
+
+serial:
+  enabled: false
+  port: "COM3"
+  baudrate: 115200
+  read_timeout_sec: 0.1
+  ack_timeout_sec: 0.5
+  retry_count: 3
+  retry_interval_sec: 0.2
+
+client:
+  host: "172.17.164.106"
+  port: 8090
+
+system:
+  com_retry_interval_sec: 2
+  worker_count: 1

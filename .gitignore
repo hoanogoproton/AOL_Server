@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+ENV/
+
+# Build artifacts
+*.spec
+build/
+dist/
+*.egg-info/
+*.whl
+
+# Project output / generated data
+output/
+images/
+plans/
+models/
+data copy/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
