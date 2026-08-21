@@ -3,13 +3,13 @@ server:
   port: 8080
 
 storage:
-  base_dir: "D:/Project Demo/AI Detect AOL/data"
-  raw_dir: "D:/Project Demo/AI Detect AOL/data/raw"
-  annotated_dir: "D:/Project Demo/AI Detect AOL/data/annotated"
-  database_path: "D:/Project Demo/AI Detect AOL/data/inspection.db"
+  base_dir: "./data"
+  raw_dir: "./data/raw"
+  annotated_dir: "./data/annotated"
+  database_path: "./data/inspection.db"
 
 model:
-  weights: "D:/Project Demo/AI Detect AOL/models/best1.pt"
+  weights: "./models/AOLv2.pt"
   device: cpu                 # GPU đầu tiên. Dùng "cpu" nếu không có GPU.
   imgsz: 1280
   min_predict_confidence: 0.4
@@ -21,7 +21,7 @@ image:
   reject_wrong_resolution: true
 
 roi:
-  csv_path: "D:/Project Demo/AI Detect AOL/roi_rules.csv"
+  csv_path: "./roi_rules.csv"
   bbox_rule: "center_inside_roi"
 
 sequence:

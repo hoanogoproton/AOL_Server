@@ -21,6 +21,7 @@ images/
 plans/
 models/
 data copy/
+data/
 
 # Editor / OS
 .vscode/

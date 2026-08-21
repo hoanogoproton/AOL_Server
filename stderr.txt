@@ -1,0 +1,14 @@
+Traceback (most recent call last):
+  File "run.py", line 1, in <module>
+    from main import app
+  File "pyimod02_importers.py", line 457, in exec_module
+  File "main.py", line 26, in <module>
+    from ultralytics import YOLO
+  File "pyimod02_importers.py", line 457, in exec_module
+  File "ultralytics\__init__.py", line 13, in <module>
+  File "pyimod02_importers.py", line 457, in exec_module
+  File "ultralytics\utils\__init__.py", line 26, in <module>
+  File "pyimod02_importers.py", line 457, in exec_module
+  File "torch\__init__.py", line 2189, in <module>
+ModuleNotFoundError: No module named 'torch.cuda'
+[PYI-3420:ERROR] Failed to execute script 'run' due to unhandled exception!

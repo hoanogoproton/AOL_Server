@@ -1457,11 +1457,14 @@ class InspectionService:
             x2 = int(det.x2)
             y2 = int(det.y2)
 
+            color_map = {0: (0, 0, 255), 1: (0, 200, 0)}
+            color = color_map.get(det.class_id, (255, 180, 0))
+
             cv2.rectangle(
                 image,
                 (x1, y1),
                 (x2, y2),
-                (255, 180, 0),
+                color,
                 2,
             )
 
@@ -1473,7 +1476,7 @@ class InspectionService:
                 (x1, max(25, y1 - 5)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
-                (255, 180, 0),
+                color,
                 2,
                 cv2.LINE_AA,
             )

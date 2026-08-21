@@ -1,0 +1,33 @@
+2026-08-17 11:49:33,970 | INFO | MainThread | Loaded 3 ROI rules from ./roi_rules.csv
+2026-08-17 11:49:33,970 | INFO | MainThread | Loading YOLO model...
+2026-08-17 11:49:34,525 | INFO | MainThread | YOLO model loaded: ./models/AOLv2.pt
+2026-08-17 11:49:34,530 | INFO | MainThread | Inspection service started
+2026-08-17 11:52:07,570 | INFO | MainThread | Image received event=CAM01-L-000000064-S1 cycle=CAM01-L-000000064 step=1
+2026-08-17 11:52:07,930 | INFO | MainThread | Image received event=CAM01-L-000000064-S3 cycle=CAM01-L-000000064 step=3
+2026-08-17 11:52:16,950 | INFO | YOLO-Worker | Inspection done event=CAM01-L-000000064-S1 cycle=CAM01-L-000000064 step=1 status=PASS error=NONE
+2026-08-17 11:52:18,051 | INFO | YOLO-Worker | Inspection done event=CAM01-L-000000064-S3 cycle=CAM01-L-000000064 step=3 status=OK error=NONE
+2026-08-17 11:52:18,169 | INFO | YOLO-Worker | Send final result cycle=CAM01-L-000000064 result=OK error=NONE
+2026-08-17 11:52:18,171 | WARNING | YOLO-Worker | Serial disabled. Simulate ACK for cycle=CAM01-L-000000064
+2026-08-17 11:52:18,269 | INFO | YOLO-Worker | COM result ACK cycle=CAM01-L-000000064
+2026-08-17 11:52:37,301 | INFO | MainThread | Image received event=CAM01-L-000000065-S1 cycle=CAM01-L-000000065 step=1
+2026-08-17 11:52:37,920 | INFO | YOLO-Worker | Inspection done event=CAM01-L-000000065-S1 cycle=CAM01-L-000000065 step=1 status=PASS error=NONE
+2026-08-17 11:52:43,221 | INFO | MainThread | Image received event=CAM01-L-000000065-S3 cycle=CAM01-L-000000065 step=3
+2026-08-17 11:52:43,742 | INFO | YOLO-Worker | Inspection done event=CAM01-L-000000065-S3 cycle=CAM01-L-000000065 step=3 status=NG error=E001_PRODUCT_OK_NOT_FOUND
+2026-08-17 11:52:43,861 | INFO | YOLO-Worker | Send final result cycle=CAM01-L-000000065 result=NG error=E001_PRODUCT_OK_NOT_FOUND
+2026-08-17 11:52:43,861 | WARNING | YOLO-Worker | Serial disabled. Simulate ACK for cycle=CAM01-L-000000065
+2026-08-17 11:52:43,981 | INFO | YOLO-Worker | COM result ACK cycle=CAM01-L-000000065
+2026-08-17 11:53:16,052 | INFO | MainThread | Image received event=CAM01-L-000000066-S1 cycle=CAM01-L-000000066 step=1
+2026-08-17 11:53:16,722 | INFO | YOLO-Worker | Inspection done event=CAM01-L-000000066-S1 cycle=CAM01-L-000000066 step=1 status=PASS error=NONE
+2026-08-17 11:53:22,622 | INFO | MainThread | Image received event=CAM01-L-000000066-S3 cycle=CAM01-L-000000066 step=3
+2026-08-17 11:53:23,216 | INFO | YOLO-Worker | Inspection done event=CAM01-L-000000066-S3 cycle=CAM01-L-000000066 step=3 status=OK error=NONE
+2026-08-17 11:53:23,355 | INFO | YOLO-Worker | Send final result cycle=CAM01-L-000000066 result=OK error=NONE
+2026-08-17 11:53:23,355 | WARNING | YOLO-Worker | Serial disabled. Simulate ACK for cycle=CAM01-L-000000066
+2026-08-17 11:53:23,496 | INFO | YOLO-Worker | COM result ACK cycle=CAM01-L-000000066
+2026-08-17 11:53:39,074 | INFO | MainThread | Image received event=CAM01-L-000000067-S1 cycle=CAM01-L-000000067 step=1
+2026-08-17 11:53:39,407 | INFO | MainThread | Image received event=CAM01-L-000000067-S3 cycle=CAM01-L-000000067 step=3
+2026-08-17 11:53:39,803 | INFO | YOLO-Worker | Inspection done event=CAM01-L-000000067-S1 cycle=CAM01-L-000000067 step=1 status=PASS error=NONE
+2026-08-17 11:53:40,393 | INFO | YOLO-Worker | Inspection done event=CAM01-L-000000067-S3 cycle=CAM01-L-000000067 step=3 status=OK error=NONE
+2026-08-17 11:53:40,553 | INFO | YOLO-Worker | Send final result cycle=CAM01-L-000000067 result=OK error=NONE
+2026-08-17 11:53:40,553 | WARNING | YOLO-Worker | Serial disabled. Simulate ACK for cycle=CAM01-L-000000067
+2026-08-17 11:53:40,682 | INFO | YOLO-Worker | COM result ACK cycle=CAM01-L-000000067
+2026-08-17 11:54:20,686 | INFO | MainThread | Inspection service stopped
