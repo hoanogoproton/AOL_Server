@@ -38,10 +38,94 @@ serial:
   retry_count: 3
   retry_interval_sec: 0.2
 
+# ============================================================
+# MERGED MODE: webhook Step 1 FAIL gửi về Camera Agent
+# đang chạy trong CÙNG process -> loopback qua chính server.
+# ============================================================
 client:
-  host: "172.17.164.106"
-  port: 8090
+  host: "127.0.0.1"
+  port: 8080
 
 system:
   com_retry_interval_sec: 2
   worker_count: 1
+
+# ============================================================
+# CAMERA AGENT (chạy chung 1 process với AI Server - merged mode)
+# ============================================================
+camera_agent:
+  agent:
+    agent_id: "CAM01"
+
+    # Chỉ dùng khi TẮT network_share ở dưới (đọc thư mục local).
+    root_path: "D:/JPG1"
+
+    # ==========================================================
+    # SHARE MẠNG TỪ MÁY KHÁC (BẬT: đọc ảnh qua network share)
+    # Nếu có mục này: root_path phía trên bị BỎ QUA, agent tự
+    #   trỏ tới: \\<host>\<share>\<subfolder>
+    #   và tự đăng nhập bằng username/password khi khởi động
+    #   (không cần chạy tay 'net use').
+    # Muốn quay lại đọc thư mục local: xóa mục network_share
+    #   hoặc đặt network_share: null.
+    # LƯU Ý: password lưu plaintext -> hạn chế quyền đọc file
+    #   config bằng NTFS ACL (chỉ tài khoản chạy Agent được đọc).
+    # ==========================================================
+    network_share:
+      host: "192.168.1.50"                 # TODO: IP hoặc hostname máy chủ share
+      share: "JPG1"                        # TODO: tên share trên máy chủ
+      subfolder: ""                        # thư mục con trong share (để rỗng nếu không có)
+      username: 'CAM-PC01\camera_user'     # TODO: tài khoản (có thể DOMAIN\user)
+      password: 'changeme'                 # TODO: mật khẩu - nên dùng NHÁY ĐƠN
+      poll_observer: true                  # SMB không hỗ trợ event realtime -> dùng polling
+
+    # Chu kỳ quét (giây) của PollingObserver (share mạng / UNC path).
+    # Nhỏ hơn = phát hiện ảnh mới nhanh hơn, nhưng tốn CPU/băng thông
+    # mạng hơn (mỗi chu kỳ quét lại toàn bộ cây thư mục).
+    # Khuyến nghị: 1-5s. Thư mục nhiều file nên giữ >= 2s.
+    poll_interval_sec: 2.0
+
+    # Chỉ dùng lần đầu cài Agent.
+    # Agent sẽ đánh dấu ảnh cũ là historical, không xử lý lại.
+    bootstrap_mode: "start_from_now"
+
+    # File phải giữ nguyên dung lượng ít nhất khoảng thời gian này
+    # mới được coi là ghi hoàn tất.
+    file_stable_sec: 0.5
+
+    # Chu kỳ kiểm tra candidate file.
+    file_check_interval_sec: 0.2
+
+    # Quét lại toàn bộ thư mục ảnh để bù event watcher bị mất.
+    reconcile_interval_sec: 10
+
+    # Ngưỡng cảnh báo: nếu chờ ảnh tiếp theo quá lâu, chỉ log WARNING,
+    # không thay đổi trạng thái stream.
+    step_timeout_sec: 500
+
+    # Ngưỡng hard-abort: nếu quá lâu không có ảnh kế tiếp, cycle bị
+    # abort (E204) và stream chuyển OUT_OF_SYNC. Phải lớn hơn mọi
+    # khoảng nghỉ bình thường của máy (kể cả ranh giới giờ / đổi ca).
+    cycle_timeout_sec: 1800
+
+    # Nếu true: ảnh hợp lệ kế tiếp sẽ tự reset stream OUT_OF_SYNC thành
+    # RUNNING + Step 1 (không cần reset tay).
+    auto_recover_out_of_sync: true
+
+    # Nếu sequence lỗi, tự động reset khi agent khởi động lại.
+    auto_reset_on_startup: true
+
+  storage:
+    database_path: "./data/agent/camera_agent.db"
+    log_dir: "./data/agent/logs"
+
+  # Agent upload ảnh về chính AI Server trong cùng process (loopback).
+  ai_server:
+    base_url: "http://127.0.0.1:8080"
+    upload_timeout_sec: 15
+    retry_interval_sec: 2
+
+  # Không còn dùng (agent không mở port riêng nữa) - giữ để tương thích.
+  local_api:
+    host: "127.0.0.1"
+    port: 8080

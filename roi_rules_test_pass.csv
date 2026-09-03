@@ -1,0 +1,4 @@
+inspection_step,roi_id,model_name,class_id,class_name,compare_x_min,compare_y_min,compare_x_max,compare_y_max,confidence,check_mode,min_count,max_count
+STEP_1,roi_001,AOLv2,0,Loi khong dung dich,368,435,1217,760,0.21,count,0,99
+STEP_3,roi_001,AOLv2,1,San pham OK,368,435,1217,760,0.21,count,0,99
+STEP_3,roi_001,AOLv2,0,Loi khong dung dich,368,435,1217,760,0.21,count,0,0

@@ -1,3 +1,4 @@
+import shutil
 import csv
 import hashlib
 import json
@@ -24,6 +25,9 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 from ultralytics import YOLO
+
+# MERGED MODE: Camera Agent chạy chung process với AI Server.
+import camera_agent as camera_agent_module
 
 
 # ============================================================
@@ -1200,6 +1204,9 @@ class InspectionService:
         self.raw_dir.mkdir(parents=True, exist_ok=True)
         self.annotated_dir.mkdir(parents=True, exist_ok=True)
 
+        self.ng_dir = Path(config["storage"]["base_dir"]) / "ng"
+        self.ng_dir.mkdir(parents=True, exist_ok=True)
+
         self.database = InspectionDatabase(
             config["storage"]["database_path"]
         )
@@ -1520,6 +1527,52 @@ class InspectionService:
 
         return str(output_path)
 
+    def save_ng_screenshot(
+        self,
+        annotated_path: str,
+        event: dict,
+    ) -> Optional[str]:
+        try:
+            src = Path(annotated_path)
+            if not src.exists():
+                LOGGER.warning("NG source not found: %s", annotated_path)
+                return None
+
+            cycle_dir = self.ng_dir / str(event["cycle_id"])
+            cycle_dir.mkdir(parents=True, exist_ok=True)
+
+            dst = cycle_dir / f"{event['event_id']}_annotated_ng.jpg"
+            shutil.copy2(str(src), str(dst))
+            LOGGER.info("NG screenshot saved: %s", dst)
+            return str(dst)
+        except Exception as ex:
+            LOGGER.error("Failed to save NG screenshot: %s", ex)
+            return None
+
+    def log_step3_csv(self, cycle: dict) -> None:
+        try:
+            log_dir = Path(self.config["storage"]["base_dir"]) / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+
+            csv_path = log_dir / f"STEP3_log_{datetime.now().strftime('%Y-%m-%d')}.csv"
+
+            write_header = not csv_path.exists()
+
+            with open(csv_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                if write_header:
+                    writer.writerow([
+                        "datetime", "product_no", "step3_result", "step3_error_code"
+                    ])
+                writer.writerow([
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    cycle.get("tube_type", ""),
+                    cycle.get("step3_status", ""),
+                    cycle.get("step3_error", "NONE"),
+                ])
+        except Exception as ex:
+            LOGGER.error("Failed to write STEP3 CSV: %s", ex)
+
     def process_event(self, event_id: str) -> None:
         event = self.database.get_image(event_id)
 
@@ -1564,6 +1617,9 @@ class InspectionService:
                 evaluation=evaluation,
                 event=event,
             )
+
+            if step == 3 and not evaluation["passed"]:
+                self.save_ng_screenshot(annotated_path, event)
 
             result_payload = {
                 "event_id": event_id,
@@ -1634,6 +1690,9 @@ class InspectionService:
                 if final_cycle:
                     self.send_com_result(final_cycle)
 
+                    if step == 3:
+                        self.log_step3_csv(final_cycle)
+
         except Exception as ex:
             LOGGER.error(
                 "Inspection failed event=%s error=%s\n%s",
@@ -1695,6 +1754,9 @@ class InspectionService:
 
                 if final_cycle:
                     self.send_com_result(final_cycle)
+
+                    if step == 3:
+                        self.log_step3_csv(final_cycle)
 
     def notify_client_step1_result(self, event: dict, step_status: str, error_code: str) -> None:
         client_cfg = self.config["client"]
@@ -1767,6 +1829,48 @@ class InspectionService:
 service: Optional[InspectionService] = None
 
 
+def start_camera_agent() -> None:
+    """
+    MERGED MODE: khởi động Camera Agent trong cùng process với AI Server.
+    Config lấy từ section 'camera_agent' trong config.yaml.
+    """
+    agent_config = CONFIG.get("camera_agent")
+
+    if not agent_config:
+        LOGGER.warning(
+            "Config khong co section 'camera_agent' -> "
+            "Camera Agent se KHONG chay (che do AI Server don le)"
+        )
+        return
+
+    camera_agent_module.CONFIG = agent_config
+    camera_agent_module.setup_logging()
+
+    agent = camera_agent_module.CameraAgent(agent_config)
+    agent.start()
+
+    # Các route của agent (mounted ở cuối file) đọc module-global này.
+    camera_agent_module.camera_agent = agent
+
+    LOGGER.info(
+        "Camera Agent started (merged) root=%s network_share=%s",
+        agent.root_path,
+        bool(agent.network_share),
+    )
+
+
+def stop_camera_agent() -> None:
+    if camera_agent_module.camera_agent is None:
+        return
+
+    try:
+        camera_agent_module.camera_agent.stop()
+    except Exception:
+        LOGGER.exception("Camera Agent stop failed")
+    finally:
+        camera_agent_module.camera_agent = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global service
@@ -1774,7 +1878,11 @@ async def lifespan(app: FastAPI):
     service = InspectionService(CONFIG)
     service.start()
 
+    start_camera_agent()
+
     yield
+
+    stop_camera_agent()
 
     if service:
         service.stop()
@@ -1792,6 +1900,8 @@ def health():
     if service is None:
         raise HTTPException(status_code=503, detail="Service not started")
 
+    camera_agent_instance = camera_agent_module.camera_agent
+
     return {
         "status": "ok",
         "time": utc_now_iso(),
@@ -1800,6 +1910,11 @@ def health():
         "serial_connected": service.serial_gateway.is_connected(),
         "queue_size": service.job_queue.qsize(),
         "client_url": f"http://{CONFIG['client']['host']}:{CONFIG['client']['port']}",
+        "camera_agent": (
+            camera_agent_instance.get_health()
+            if camera_agent_instance is not None
+            else None
+        ),
     }
 
 
@@ -2103,3 +2218,17 @@ def live_detection():
 
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+# ============================================================
+# MERGED MODE: CAMERA AGENT (mount vào cùng app, cùng port)
+# ============================================================
+# Mount agent app ở CUỐI file:
+# - Route của main (đăng ký trước) được ưu tiên khi trùng path
+#   (ví dụ /health là của AI Server).
+# - Route agent giữ nguyên URL cũ như khi chạy riêng:
+#     GET  /api/v1/streams
+#     POST /api/v1/reset/{camera_side}
+#     POST /api/v1/inspection-result   (webhook Step 1 FAIL - loopback)
+# Mount "/" phải nằm sau cùng để không che route/static ở trên.
+app.mount("/", camera_agent_module.app)

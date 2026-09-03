@@ -6,3 +6,4 @@ opencv-python
 pyserial
 PyYAML
 requests
+watchdog
