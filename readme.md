@@ -42,13 +42,42 @@ hoặc double-click `start_server.bat`.
 | Webhook Step 1 FAIL (loopback) | POST /api/v1/inspection-result |
 | Abort cycle (agent tự gọi - loopback) | POST /api/v1/cycles/abort |
 
+## Xử lý sự cố: không mở được Web UI
+
+1. **Đúng địa chỉ là `http://127.0.0.1:8080`** (hoặc `http://localhost:8080`).
+   Gõ nhầm IP khác (vd `172.0.0.1:8080`) sẽ không bao giờ mở được.
+2. `start_server.bat` đã **pin `config.yaml` và xóa override** `AI_CONFIG`/
+   `AI_PORT`/`AI_HOST` còn sót trong terminal (env sót kiểu này làm server
+   chạy nhầm config/port — ví dụ `config_ng_test.yaml` chạy ở port **8182**),
+   đồng thời **tự mở trình duyệt** sau ~8 giây.
+3. Từ bản này, Camera Agent lỗi (mất share, sai đường dẫn) **không làm sập
+   server**: web UI vẫn mở, `/health` report `"camera_agent": null`, nguyên
+   nhân nằm trong log với dòng `Camera Agent FAILED to start`.
+4. Kiểm tra nhanh: mở `http://127.0.0.1:8080/health` — trả 200 là server sống.
+
 ## Cấu hình (config.yaml)
 
+- `storage.ng_dir` (mới — thư mục lưu kết quả NG):
+  - Chỉ tới **network share (UNC path)** hoặc thư mục local, ví dụ:
+    `ng_dir: '\\172.17.108.168\Anh AOL NG'` (bắt buộc dùng **nháy đơn**
+    để dấu `\` giữ nguyên).
+  - Bên trong tự tạo: `<ng_dir>/<cycle_id>/<ten_anh>_annotated.jpg`
+    (ảnh NG đã annotate), `<ng_dir>/<cycle_id>/<ten_anh>.jpg`
+    (ảnh raw NG — bản gốc camera upload) và
+    `<ng_dir>/logs/STEP3_log_YYYY-MM-DD.csv`
+    (file log Step 3, xoay theo ngày).
+  - Xóa mục này / để rỗng → về mặc định cũ: ảnh NG ở `<base_dir>/ng`,
+    log ở `<base_dir>/logs`.
+  - Máy chạy server cần **quyền GHI** vào share (`net use` trước hoặc share
+    cho phép ghi). Nếu share không truy cập được lúc khởi động, server
+    **tự fallback** về `<base_dir>/ng` và ghi lỗi vào log — không bị chệt.
 - Section `camera_agent` (mới — cấu hình của Camera Agent):
   - Đọc ảnh qua **network share máy khác**: giữ mục `network_share`
     và điền `host`, `share`, `subfolder`, `username`, `password` thật.
   - Đọc thư mục **local**: xóa mục `network_share` (hoặc đặt `network_share: null`),
-    điền `root_path` (ví dụ `D:/JPG1`).
+    điền `root_path` (ví dụ `D:/JPG1`). Thư mục này được **tự tạo** khi
+    khởi động nếu chưa có (chỉ áp dụng cho path local; UNC/network share
+    thì báo lỗi thay vì tự tạo).
   - `ai_server.base_url` luôn là `http://127.0.0.1:8080` (loopback tới chính nó).
 - Section `client`: để `127.0.0.1:8080` (webhook Step 1 FAIL loopback).
 - `serial`: COM port của Arduino cắm vào máy này. Logic đã đơn giản:

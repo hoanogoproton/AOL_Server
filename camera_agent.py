@@ -1542,15 +1542,54 @@ class CameraAgent:
     # START / STOP
     # --------------------------------------------------------
 
+    def ensure_root_path(self) -> None:
+        """
+        Dam bao thu muc watch (root_path) ton tai truoc khi start.
+
+        - Local path: TU TAO khi chua co (kem cac thu muc cha) de
+          server luon khoi dong duoc sau khi clone repo hoac xoa
+          nham thu muc watch.
+        - Network share / UNC: KHONG tu tao (thu muc nam tren may
+          khac) -> bao loi kem goi y kiem tra SMB.
+        """
+        if self.root_path.is_dir():
+            return
+
+        # Ton tai nhung la file, khong phai thu muc -> cau hinh sai.
+        if self.root_path.exists():
+            raise RuntimeError(
+                f"Root path is not a directory: {self.root_path}. "
+                "Fix 'root_path' in config."
+            )
+
+        # UNC path (vd \\host\share) co .drive bat dau bang "\\".
+        is_unc = self.root_path.drive.startswith("\\\\")
+
+        if self.network_share or is_unc:
+            raise RuntimeError(
+                f"Root path not found on network share: "
+                f"{self.root_path}. Check host, share name, "
+                "'subfolder' in network_share config, credentials, "
+                "firewall and SMB port 445."
+            )
+
+        try:
+            self.root_path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot create watch directory {self.root_path}: "
+                f"{exc}. Check 'root_path' in config and write "
+                "permission."
+            ) from exc
+
+        LOGGER.info(
+            "Watch directory auto-created: %s",
+            self.root_path,
+        )
+
     def start(self) -> None:
         self.connect_network_share()
-
-        if not self.root_path.exists():
-            raise RuntimeError(
-                f"Root path not found: {self.root_path}. Check "
-                "host, share name, credentials, firewall and "
-                "SMB port 445."
-            )
+        self.ensure_root_path()
 
         self.bootstrap_if_needed()
         self.auto_reset_streams()

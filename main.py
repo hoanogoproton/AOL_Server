@@ -94,6 +94,28 @@ def utc_now_iso() -> str:
     return datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
 
 
+def sanitize_filename(value: Optional[str]) -> Optional[str]:
+    """
+    Làm sạch tên file gốc do camera agent gửi kèm multipart:
+    - Bỏ thành phần thư mục (chống path traversal).
+    - Thay ký tự ngoài A-Za-z0-9 _ . - ( ) [ ] và khoảng trắng bằng '_'.
+    - Giới hạn 200 ký tự.
+    Trả về None nếu tên rỗng/không hợp lệ.
+    """
+    if not value:
+        return None
+
+    name = Path(value).name.strip()
+
+    if not name or name in {".", ".."}:
+        return None
+
+    name = re.sub(r"[^A-Za-z0-9_.\-\(\)\[\] ]", "_", name).strip(" .")
+
+    return name[:200] or None
+
+
+
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
 
@@ -371,6 +393,7 @@ class InspectionDatabase:
                         tube_type TEXT NOT NULL,
                         step INTEGER NOT NULL,
                         capture_timestamp TEXT NOT NULL,
+                        original_filename TEXT,
 
                         image_path TEXT NOT NULL,
                         image_sha256 TEXT NOT NULL,
@@ -396,6 +419,21 @@ class InspectionDatabase:
                 )
                 conn.commit()
 
+                # Migration nhẹ cho DB cũ: thêm cột original_filename
+                # nếu chưa tồn tại (lưu tên file ảnh gốc do camera đặt).
+                image_columns = {
+                    row["name"]
+                    for row in conn.execute(
+                        "PRAGMA table_info(images)"
+                    ).fetchall()
+                }
+
+                if "original_filename" not in image_columns:
+                    conn.execute(
+                        "ALTER TABLE images ADD COLUMN original_filename TEXT"
+                    )
+                    conn.commit()
+
             finally:
                 conn.close()
 
@@ -404,6 +442,7 @@ class InspectionDatabase:
         metadata: ImageMetadata,
         image_path: str,
         image_sha256: str,
+        original_filename: Optional[str] = None,
     ) -> bool:
         with self.lock:
             conn = self.connect()
@@ -434,11 +473,12 @@ class InspectionDatabase:
                         tube_type,
                         step,
                         capture_timestamp,
+                        original_filename,
                         image_path,
                         image_sha256,
                         image_status
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'RECEIVED')
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'RECEIVED')
                     """,
                     (
                         metadata.event_id,
@@ -448,6 +488,8 @@ class InspectionDatabase:
                         metadata.step,
 
                         metadata.observed_at,
+
+                        original_filename,
 
                         image_path,
                         image_sha256,
@@ -1100,8 +1142,42 @@ class InspectionService:
         self.raw_dir.mkdir(parents=True, exist_ok=True)
         self.annotated_dir.mkdir(parents=True, exist_ok=True)
 
-        self.ng_dir = Path(config["storage"]["base_dir"]) / "ng"
-        self.ng_dir.mkdir(parents=True, exist_ok=True)
+        # ====================================================
+        # Thu muc goc luu ket qua NG (anh NG + file log STEP3).
+        # Cho phep tro vao network share (UNC path) qua config
+        # 'storage.ng_dir'; khong cau hinh -> giu hanh vi cu
+        # (<base_dir>/ng). Share khong truy cap duoc khi khoi
+        # dong -> fallback ve thu muc local, khong lam chet server.
+        # ====================================================
+        storage_cfg = config.get("storage") or {}
+
+        default_ng_dir = Path(storage_cfg["base_dir"]) / "ng"
+        configured_ng_dir = storage_cfg.get("ng_dir")
+
+        if configured_ng_dir:
+            self.ng_dir = Path(str(configured_ng_dir))
+        else:
+            self.ng_dir = default_ng_dir
+
+        try:
+            self.ng_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as ex:
+            LOGGER.error(
+                "Khong tao duoc thu muc NG '%s' (%s). "
+                "Fallback ve thu muc local '%s'.",
+                self.ng_dir,
+                ex,
+                default_ng_dir,
+            )
+            self.ng_dir = default_ng_dir
+            self.ng_dir.mkdir(parents=True, exist_ok=True)
+
+        # File log STEP3 (CSV) cung dua ve thu muc NG khi cau hinh
+        # 'ng_dir'; khong cau hinh -> giu hanh vi cu (<base_dir>/logs).
+        if configured_ng_dir:
+            self.step3_log_dir = self.ng_dir / "logs"
+        else:
+            self.step3_log_dir = Path(storage_cfg["base_dir"]) / "logs"
 
         self.database = InspectionDatabase(
             config["storage"]["database_path"]
@@ -1418,6 +1494,13 @@ class InspectionService:
         annotated_path: str,
         event: dict,
     ) -> Optional[str]:
+        """
+        Copy ket qua NG Step 3 sang thu muc NG (storage.ng_dir):
+        - Anh annotated (da ve khung + nhan): <cycle_id>/<stem>_annotated.jpg
+        - Anh raw (ban goc camera upload):    <cycle_id>/<stem>.jpg
+
+        Tra ve duong dan anh annotated (hoac None khi loi).
+        """
         try:
             src = Path(annotated_path)
             if not src.exists():
@@ -1427,34 +1510,94 @@ class InspectionService:
             cycle_dir = self.ng_dir / str(event["cycle_id"])
             cycle_dir.mkdir(parents=True, exist_ok=True)
 
-            dst = cycle_dir / f"{event['event_id']}_annotated_ng.jpg"
+            # Ưu tiên tên file ảnh gốc do camera đặt (vd IMG001.jpg
+            # -> IMG001_annotated.jpg); fallback về event_id nếu thiếu.
+            original_stem = Path(event.get("original_filename") or "").stem
+
+            if not original_stem:
+                original_stem = str(event["event_id"])
+
+            dst = cycle_dir / f"{original_stem}_annotated.jpg"
             shutil.copy2(str(src), str(dst))
             LOGGER.info("NG screenshot saved: %s", dst)
+
+            # Lưu kèm ảnh raw NG (bản gốc chưa annotate) để đối chiếu.
+            # Lỗi copy raw không làm mất kết quả copy annotated.
+            self._save_ng_raw_copy(event, cycle_dir, original_stem)
+
             return str(dst)
         except Exception as ex:
             LOGGER.error("Failed to save NG screenshot: %s", ex)
             return None
 
-    def log_step3_csv(self, cycle: dict) -> None:
+    def _save_ng_raw_copy(
+        self,
+        event: dict,
+        cycle_dir: Path,
+        original_stem: str,
+    ) -> None:
+        raw_src = event.get("image_path")
+
+        if not raw_src:
+            LOGGER.warning("NG raw image skipped: no image_path")
+            return
+
         try:
-            log_dir = Path(self.config["storage"]["base_dir"]) / "logs"
+            raw_src_path = Path(raw_src)
+
+            if not raw_src_path.exists():
+                LOGGER.warning("NG raw image not found: %s", raw_src)
+                return
+
+            # Giữ đuôi file gốc của ảnh raw (mặc định .jpg).
+            raw_dst = (
+                cycle_dir
+                / f"{original_stem}{raw_src_path.suffix or '.jpg'}"
+            )
+            shutil.copy2(str(raw_src_path), str(raw_dst))
+            LOGGER.info("NG raw image saved: %s", raw_dst)
+        except Exception as ex:
+            LOGGER.error("Failed to save NG raw image: %s", ex)
+
+    def log_step3_csv(self, cycle: dict, event: dict) -> None:
+        try:
+            # Thu muc log da duoc quy dinh trong __init__:
+            # <ng_dir>/logs khi co 'storage.ng_dir', khong thi <base_dir>/logs.
+            log_dir = self.step3_log_dir
             log_dir.mkdir(parents=True, exist_ok=True)
 
             csv_path = log_dir / f"STEP3_log_{datetime.now().strftime('%Y-%m-%d')}.csv"
 
             write_header = not csv_path.exists()
 
+            # Tên file ảnh gốc do camera đặt; fallback về tên file
+            # ảnh gốc trên server ({event_id}.jpg) nếu thiếu.
+            image_name = (
+                event.get("original_filename")
+                or Path(event.get("image_path") or "").name
+                or ""
+            )
+
+            # Ảnh NG chỉ tồn tại khi Step 3 không OK (xem save_ng_screenshot).
+            ng_image_name = ""
+            if cycle.get("step3_status") not in (None, "", "OK"):
+                ng_stem = Path(image_name).stem if image_name else event.get("event_id", "")
+                ng_image_name = f"{ng_stem}_annotated.jpg"
+
             with open(csv_path, "a", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 if write_header:
                     writer.writerow([
-                        "datetime", "product_no", "step3_result", "step3_error_code"
+                        "datetime", "product_no", "image_name",
+                        "step3_result", "step3_error_code", "ng_image_name"
                     ])
                 writer.writerow([
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     cycle.get("tube_type", ""),
+                    image_name,
                     cycle.get("step3_status", ""),
                     cycle.get("step3_error", "NONE"),
+                    ng_image_name,
                 ])
         except Exception as ex:
             LOGGER.error("Failed to write STEP3 CSV: %s", ex)
@@ -1575,7 +1718,7 @@ class InspectionService:
                 )
 
                 if final_cycle and step == 3:
-                    self.log_step3_csv(final_cycle)
+                    self.log_step3_csv(final_cycle, event)
 
         except Exception as ex:
             LOGGER.error(
@@ -1637,7 +1780,7 @@ class InspectionService:
                 )
 
                 if final_cycle and step == 3:
-                    self.log_step3_csv(final_cycle)
+                    self.log_step3_csv(final_cycle, event)
 
     def notify_client_step1_result(self, event: dict, step_status: str, error_code: str) -> None:
         client_cfg = self.config["client"]
@@ -1675,6 +1818,10 @@ def start_camera_agent() -> None:
     """
     MERGED MODE: khởi động Camera Agent trong cùng process với AI Server.
     Config lấy từ section 'camera_agent' trong config.yaml.
+
+    Agent start THẤT BẠI (mất network share, sai root_path, ...) KHÔNG
+    làm sập AI Server: web UI vẫn mở được để theo dõi, /health sẽ
+    report "camera_agent": null, nguyên nhân đầy đủ nằm trong log.
     """
     agent_config = CONFIG.get("camera_agent")
 
@@ -1688,8 +1835,19 @@ def start_camera_agent() -> None:
     camera_agent_module.CONFIG = agent_config
     camera_agent_module.setup_logging()
 
-    agent = camera_agent_module.CameraAgent(agent_config)
-    agent.start()
+    try:
+        agent = camera_agent_module.CameraAgent(agent_config)
+        agent.start()
+    except Exception:
+        LOGGER.critical(
+            "Camera Agent FAILED to start -> AI Server van chay nhung "
+            "KHONG nhan du anh tu camera. Kiem tra network_share / "
+            "root_path trong 'camera_agent' config roi khoi dong lai. "
+            "Web UI: http://127.0.0.1:%s",
+            CONFIG.get("server", {}).get("port", 8080),
+            exc_info=True,
+        )
+        return
 
     # Các route của agent (mounted ở cuối file) đọc module-global này.
     camera_agent_module.camera_agent = agent
@@ -1846,6 +2004,7 @@ async def upload_image(
             metadata=parsed_metadata,
             image_path=str(final_path),
             image_sha256=sha256.hexdigest(),
+            original_filename=sanitize_filename(image.filename),
         )
 
         if inserted:
