@@ -30,20 +30,18 @@ sequence:
   server_cycle_timeout_sec: 120
 
 serial:
+  # Don gian: Step 3 NG -> gui ky tu '0' qua COM. Khong ACK, khong CRC.
   enabled: false
   port: "COM3"
   baudrate: 115200
-  read_timeout_sec: 0.1
-  ack_timeout_sec: 0.5
-  retry_count: 3
-  retry_interval_sec: 0.2
+  retry_count: 3           # so lan gui lai khi port COM loi
+  retry_interval_sec: 0.2  # nghi giua cac lan retry (giay)
 
 client:
   host: "127.0.0.1"
   port: 8181
 
 system:
-  com_retry_interval_sec: 2
   worker_count: 1
 
 camera_agent:

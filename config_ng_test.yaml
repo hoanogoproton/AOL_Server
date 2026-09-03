@@ -1,12 +1,12 @@
 server:
   host: "127.0.0.1"
-  port: 8180
+  port: 8182
 
 storage:
-  base_dir: "./data/test"
-  raw_dir: "./data/test/raw"
-  annotated_dir: "./data/test/annotated"
-  database_path: "./data/test/inspection.db"
+  base_dir: "./data/test_ng"
+  raw_dir: "./data/test_ng/raw"
+  annotated_dir: "./data/test_ng/annotated"
+  database_path: "./data/test_ng/inspection.db"
 
 model:
   weights: "./models/AOLv2.pt"
@@ -21,8 +21,9 @@ image:
   reject_wrong_resolution: true
 
 roi:
-  # Rule test: ảnh rỗng (0 detection) vẫn PASS mọi ROI.
-  csv_path: "./roi_rules_test_pass.csv"
+  # Step 1 cho phep anh rong PASS; Step 3 yeu cau >= 1 san pham OK
+  # -> anh den (0 detection) se NG o Step 3 -> kich ban gui tin hieu '0'.
+  csv_path: "./tests/roi_rules_ng_test.csv"
   bbox_rule: "center_inside_roi"
 
 sequence:
@@ -30,6 +31,7 @@ sequence:
 
 serial:
   # Don gian: Step 3 NG -> gui ky tu '0' qua COM. Khong ACK, khong CRC.
+  # Test de enabled: false -> chi log "Skip NG signal (simulate sent)".
   enabled: false
   port: "COM3"
   baudrate: 115200
@@ -38,16 +40,15 @@ serial:
 
 client:
   host: "127.0.0.1"
-  port: 8180
+  port: 8182
 
 system:
   worker_count: 1
 
-# Camera Agent chạy merged, đọc thư mục LOCAL (không dùng share) cho test.
 camera_agent:
   agent:
-    agent_id: "TEST01"
-    root_path: "./data/test/watch"
+    agent_id: "TESTNG"
+    root_path: "./data/test_ng/watch"
     network_share: null
     poll_interval_sec: 0.5
     bootstrap_mode: "start_from_now"
@@ -60,14 +61,14 @@ camera_agent:
     auto_reset_on_startup: true
 
   storage:
-    database_path: "./data/test/agent/camera_agent.db"
-    log_dir: "./data/test/agent/logs"
+    database_path: "./data/test_ng/agent/camera_agent.db"
+    log_dir: "./data/test_ng/agent/logs"
 
   ai_server:
-    base_url: "http://127.0.0.1:8180"
+    base_url: "http://127.0.0.1:8182"
     upload_timeout_sec: 15
     retry_interval_sec: 1
 
   local_api:
     host: "127.0.0.1"
-    port: 8180
+    port: 8182

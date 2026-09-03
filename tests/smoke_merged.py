@@ -10,7 +10,7 @@ Cach dung:
        .\.venv\Scripts\python.exe tests\smoke_merged.py --scenario fail --base-url http://127.0.0.1:8181
 
 Scenario "pass": ghi 3 anh vao thu muc watch -> agent assign Step 1/2/3 ->
-upload loopback -> YOLO -> cycle OK + COM ACK (serial simulation).
+upload loopback -> YOLO -> cycle OK (serial disabled: khong gui COM).
 
 Scenario "fail" (can server chay config_test_fail.yaml):
 anh Step 1 FAIL -> server webhook loopback /api/v1/inspection-result ->
@@ -172,16 +172,16 @@ def main() -> int:
         )
         print("   OK: Client-side hoan tat cycle")
 
-        print("== 6. Doi final_result=OK + com_status=ACK (serial simulation)...")
+        print("== 6. Doi final_result=OK...")
         wait_for(
             lambda: any(
-                c["final_result"] == "OK" and c["com_status"] == "ACK"
+                c["final_result"] == "OK"
                 for c in get_cycles(base_url)
             ),
             timeout_sec=args.timeout,
-            desc="final_result=OK va com_status=ACK",
+            desc="final_result == OK",
         )
-        print("   OK: Cycle OK + COM ACK")
+        print("   OK: Cycle OK")
 
         cycle = next(
             c for c in get_cycles(base_url)

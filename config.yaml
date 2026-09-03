@@ -30,13 +30,12 @@ sequence:
   server_cycle_timeout_sec: 120
 
 serial:
+  # Don gian: Step 3 NG -> gui ky tu '0' qua COM. Khong ACK, khong CRC.
   enabled: false
   port: "COM3"
   baudrate: 115200
-  read_timeout_sec: 0.1
-  ack_timeout_sec: 0.5
-  retry_count: 3
-  retry_interval_sec: 0.2
+  retry_count: 3           # so lan gui lai khi port COM loi
+  retry_interval_sec: 0.2  # nghi giua cac lan retry (giay)
 
 # ============================================================
 # MERGED MODE: webhook Step 1 FAIL gửi về Camera Agent
@@ -47,7 +46,6 @@ client:
   port: 8080
 
 system:
-  com_retry_interval_sec: 2
   worker_count: 1
 
 # ============================================================
@@ -58,7 +56,7 @@ camera_agent:
     agent_id: "CAM01"
 
     # Chỉ dùng khi TẮT network_share ở dưới (đọc thư mục local).
-    root_path: "D:/JPG1"
+    root_path: "R:\\JPG1"
 
     # ==========================================================
     # SHARE MẠNG TỪ MÁY KHÁC (BẬT: đọc ảnh qua network share)
@@ -71,13 +69,13 @@ camera_agent:
     # LƯU Ý: password lưu plaintext -> hạn chế quyền đọc file
     #   config bằng NTFS ACL (chỉ tài khoản chạy Agent được đọc).
     # ==========================================================
-    network_share:
-      host: "192.168.1.50"                 # TODO: IP hoặc hostname máy chủ share
-      share: "JPG1"                        # TODO: tên share trên máy chủ
-      subfolder: ""                        # thư mục con trong share (để rỗng nếu không có)
-      username: 'CAM-PC01\camera_user'     # TODO: tài khoản (có thể DOMAIN\user)
-      password: 'changeme'                 # TODO: mật khẩu - nên dùng NHÁY ĐƠN
-      poll_observer: true                  # SMB không hỗ trợ event realtime -> dùng polling
+    network_share: null
+      # host: "192.168.1.50"                 # TODO: IP hoặc hostname máy chủ share
+      # share: "JPG1"                        # TODO: tên share trên máy chủ
+      # subfolder: ""                        # thư mục con trong share (để rỗng nếu không có)
+      # username: 'CAM-PC01\camera_user'     # TODO: tài khoản (có thể DOMAIN\user)
+      # password: 'changeme'                 # TODO: mật khẩu - nên dùng NHÁY ĐƠN
+      # poll_observer: true                  # SMB không hỗ trợ event realtime -> dùng polling
 
     # Chu kỳ quét (giây) của PollingObserver (share mạng / UNC path).
     # Nhỏ hơn = phát hiện ảnh mới nhanh hơn, nhưng tốn CPU/băng thông

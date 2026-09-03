@@ -107,21 +107,6 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def crc16_modbus(data: bytes) -> int:
-    crc = 0xFFFF
-
-    for byte in data:
-        crc ^= byte
-
-        for _ in range(8):
-            if crc & 0x0001:
-                crc = (crc >> 1) ^ 0xA001
-            else:
-                crc >>= 1
-
-    return crc & 0xFFFF
-
-
 def detect_image_suffix(header: bytes) -> str:
     if header.startswith(b"\xFF\xD8\xFF"):
         return ".jpg"
@@ -804,53 +789,6 @@ class InspectionDatabase:
             finally:
                 conn.close()
 
-    def pending_com_results(self, retry_interval_sec: int) -> list[dict]:
-        with self.lock:
-            conn = self.connect()
-
-            try:
-                rows = conn.execute(
-                    """
-                    SELECT *
-                    FROM cycles
-                    WHERE com_status IN ('PENDING', 'RETRY')
-                    AND (
-                        com_updated_at IS NULL
-                        OR (
-                            julianday('now') - julianday(com_updated_at)
-                        ) * 86400 >= ?
-                    )
-                    ORDER BY id ASC
-                    """,
-                    (retry_interval_sec,),
-                ).fetchall()
-
-                return [dict(row) for row in rows]
-
-            finally:
-                conn.close()
-
-    def update_com_status(self, cycle_id: str, com_status: str) -> None:
-        with self.lock:
-            conn = self.connect()
-
-            try:
-                conn.execute(
-                    """
-                    UPDATE cycles
-                    SET
-                        com_status = ?,
-                        com_updated_at = CURRENT_TIMESTAMP,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE cycle_id = ?
-                    """,
-                    (com_status, cycle_id),
-                )
-                conn.commit()
-
-            finally:
-                conn.close()
-
     def get_cycle(self, cycle_id: str) -> Optional[dict]:
         with self.lock:
             conn = self.connect()
@@ -1046,21 +984,36 @@ class InspectionDatabase:
 
 
 # ============================================================
-# SERIAL / ARDUINO GATEWAY
+# SERIAL / ARDUINO SIGNAL SENDER
 # ============================================================
 
-class ArduinoSerialGateway:
+class ArduinoSignalSender:
+    """
+    Gửi tín hiệu đơn giản qua COM tới Arduino.
+
+    Giao thức: khi Step 3 phát hiện sản phẩm lỗi (NG) thì gửi b"0\r\n".
+    Không packet, không CRC, không SEQ, không chờ ACK (fire-and-forget).
+    Chỉ retry khi cổng COM lỗi (rút cáp, port bận...) — không có vòng
+    retry ở tầng DB/monitor.
+    """
+
+    NG_SIGNAL = b"0\r\n"
+
     def __init__(self, config: dict):
         self.enabled = bool(config["enabled"])
         self.port = config["port"]
         self.baudrate = int(config["baudrate"])
-        self.read_timeout_sec = float(config["read_timeout_sec"])
-        self.ack_timeout_sec = float(config["ack_timeout_sec"])
-        self.retry_count = int(config["retry_count"])
-        self.retry_interval_sec = float(config["retry_interval_sec"])
+        self.retry_count = int(config.get("retry_count", 3))
+        self.retry_interval_sec = float(config.get("retry_interval_sec", 0.2))
 
         self.serial_conn: Optional[serial.Serial] = None
         self.lock = threading.Lock()
+
+    def is_connected(self) -> bool:
+        return bool(
+            self.serial_conn is not None
+            and self.serial_conn.is_open
+        )
 
     def ensure_open(self) -> None:
         if not self.enabled:
@@ -1074,10 +1027,11 @@ class ArduinoSerialGateway:
         self.serial_conn = serial.Serial(
             port=self.port,
             baudrate=self.baudrate,
-            timeout=self.read_timeout_sec,
+            timeout=0.1,
             write_timeout=1,
         )
 
+        # Mở cổng kéo DTR lên -> Arduino tự reset, chờ bootloader xong.
         time.sleep(1.5)
 
         try:
@@ -1086,39 +1040,13 @@ class ArduinoSerialGateway:
         except Exception:
             pass
 
-    def is_connected(self) -> bool:
-        return bool(
-            self.serial_conn is not None
-            and self.serial_conn.is_open
-        )
-
-    def build_packet(self, cycle: dict) -> tuple[str, str]:
-        sequence = f"{int(cycle['id']):08d}"
-
-        body = (
-            f"RESULT,"
-            f"SEQ={sequence},"
-            f"CYCLE={cycle['cycle_id']},"
-            f"NO={cycle['tube_type']},"
-            f"SIDE={cycle['camera_side']},"
-            f"RESULT={cycle['final_result']},"
-            f"ERROR={cycle['final_error']}"
-        )
-
-        crc = crc16_modbus(body.encode("ascii", errors="ignore"))
-        packet = f"<{body},CRC={crc:04X}>\r\n"
-
-        return sequence, packet
-
-    def send_result(self, cycle: dict) -> bool:
+    def send_ng_signal(self) -> bool:
+        """
+        Gửi ký tự '0' báo Step 3 NG. True = đã ghi ra cổng thành công.
+        """
         if not self.enabled:
-            LOGGER.warning(
-                "Serial disabled. Simulate ACK for cycle=%s",
-                cycle["cycle_id"],
-            )
+            LOGGER.warning("Serial disabled. Skip NG signal (simulate sent).")
             return True
-
-        sequence, packet = self.build_packet(cycle)
 
         with self.lock:
             for attempt in range(1, self.retry_count + 1):
@@ -1127,48 +1055,19 @@ class ArduinoSerialGateway:
 
                     assert self.serial_conn is not None
 
-                    try:
-                        self.serial_conn.reset_input_buffer()
-                    except Exception:
-                        pass
-
-                    LOGGER.info(
-                        "COM send attempt=%s seq=%s packet=%s",
-                        attempt,
-                        sequence,
-                        packet.strip(),
-                    )
-
-                    self.serial_conn.write(packet.encode("ascii"))
+                    self.serial_conn.write(self.NG_SIGNAL)
                     self.serial_conn.flush()
 
-                    deadline = time.monotonic() + self.ack_timeout_sec
-
-                    while time.monotonic() < deadline:
-                        line = self.serial_conn.readline()
-
-                        if not line:
-                            continue
-
-                        text = line.decode(
-                            "ascii",
-                            errors="ignore"
-                        ).strip()
-
-                        LOGGER.info("COM RX: %s", text)
-
-                        # Arduino phải trả ví dụ:
-                        # <ACK,SEQ=00000001>
-                        if "ACK" in text and f"SEQ={sequence}" in text:
-                            LOGGER.info(
-                                "COM ACK received seq=%s",
-                                sequence,
-                            )
-                            return True
+                    LOGGER.info(
+                        "NG signal '0' sent to %s attempt=%s",
+                        self.port,
+                        attempt,
+                    )
+                    return True
 
                 except Exception as ex:
                     LOGGER.error(
-                        "Serial error attempt=%s: %s",
+                        "Serial write failed attempt=%s: %s",
                         attempt,
                         ex,
                     )
@@ -1183,10 +1082,7 @@ class ArduinoSerialGateway:
 
                 time.sleep(self.retry_interval_sec)
 
-        LOGGER.error(
-            "COM ACK timeout after retries. cycle=%s",
-            cycle["cycle_id"],
-        )
+        LOGGER.error("NG signal FAILED after retries. COM=%s", self.port)
         return False
 
 
@@ -1215,7 +1111,7 @@ class InspectionService:
             config["roi"]["csv_path"]
         )
 
-        self.serial_gateway = ArduinoSerialGateway(
+        self.signal_sender = ArduinoSignalSender(
             config["serial"]
         )
 
@@ -1226,8 +1122,6 @@ class InspectionService:
 
         self.worker_thread: Optional[threading.Thread] = None
         self.monitor_thread: Optional[threading.Thread] = None
-
-        self.com_send_lock = threading.Lock()
 
     def get_model_name(self) -> str:
         weights_path = str(self.config["model"]["weights"])
@@ -1298,31 +1192,23 @@ class InspectionService:
                 self.job_queue.task_done()
 
     def monitor_loop(self) -> None:
+        """
+        Chỉ xử lý cycle timeout (thiếu Step 1/Step 3) -> ghi NG vào DB.
+
+        Gửi tín hiệu COM không nằm ở đây: chỉ gửi '0' ngay khi Step 3 NG
+        (xem process_event).
+        """
         while not self.stop_event.is_set():
             try:
                 timeout_sec = int(
                     self.config["sequence"]["server_cycle_timeout_sec"]
                 )
 
-                timeout_cycles = self.database.timeout_cycles(timeout_sec)
-
-                for cycle in timeout_cycles:
+                for cycle in self.database.timeout_cycles(timeout_sec):
                     LOGGER.error(
                         "Cycle timeout: %s",
                         cycle["cycle_id"],
                     )
-                    self.send_com_result(cycle)
-
-                retry_interval = int(
-                    self.config["system"]["com_retry_interval_sec"]
-                )
-
-                pending = self.database.pending_com_results(
-                    retry_interval
-                )
-
-                for cycle in pending:
-                    self.send_com_result(cycle)
 
             except Exception:
                 LOGGER.exception("Monitor loop error")
@@ -1620,6 +1506,7 @@ class InspectionService:
 
             if step == 3 and not evaluation["passed"]:
                 self.save_ng_screenshot(annotated_path, event)
+                self.signal_sender.send_ng_signal()
 
             result_payload = {
                 "event_id": event_id,
@@ -1687,11 +1574,8 @@ class InspectionService:
                     event["cycle_id"]
                 )
 
-                if final_cycle:
-                    self.send_com_result(final_cycle)
-
-                    if step == 3:
-                        self.log_step3_csv(final_cycle)
+                if final_cycle and step == 3:
+                    self.log_step3_csv(final_cycle)
 
         except Exception as ex:
             LOGGER.error(
@@ -1752,11 +1636,8 @@ class InspectionService:
                     event["cycle_id"]
                 )
 
-                if final_cycle:
-                    self.send_com_result(final_cycle)
-
-                    if step == 3:
-                        self.log_step3_csv(final_cycle)
+                if final_cycle and step == 3:
+                    self.log_step3_csv(final_cycle)
 
     def notify_client_step1_result(self, event: dict, step_status: str, error_code: str) -> None:
         client_cfg = self.config["client"]
@@ -1781,45 +1662,6 @@ class InspectionService:
                 if attempt < 3:
                     time.sleep(0.5)
         LOGGER.error("Webhook S1 result FAILED after 3 retries cycle=%s", event["cycle_id"])
-
-    def send_com_result(self, cycle: dict) -> None:
-        """
-        Arduino cần xử lý duplicate SEQ theo cơ chế idempotent:
-        cùng SEQ gửi lại nhiều lần chỉ kích relay một lần.
-        """
-        with self.com_send_lock:
-            if cycle["com_status"] == "ACK":
-                return
-
-            LOGGER.info(
-                "Send final result cycle=%s result=%s error=%s",
-                cycle["cycle_id"],
-                cycle["final_result"],
-                cycle["final_error"],
-            )
-
-            success = self.serial_gateway.send_result(cycle)
-
-            if success:
-                self.database.update_com_status(
-                    cycle["cycle_id"],
-                    "ACK",
-                )
-
-                LOGGER.info(
-                    "COM result ACK cycle=%s",
-                    cycle["cycle_id"],
-                )
-            else:
-                self.database.update_com_status(
-                    cycle["cycle_id"],
-                    "RETRY",
-                )
-
-                LOGGER.error(
-                    "COM result retry pending cycle=%s",
-                    cycle["cycle_id"],
-                )
 
 
 # ============================================================
@@ -1889,7 +1731,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="AI Tube Inspection Server",
+    title="AOL Inspection Server",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -1907,7 +1749,7 @@ def health():
         "time": utc_now_iso(),
         "model_path": CONFIG["model"]["weights"],
         "serial_enabled": CONFIG["serial"]["enabled"],
-        "serial_connected": service.serial_gateway.is_connected(),
+        "serial_connected": service.signal_sender.is_connected(),
         "queue_size": service.job_queue.qsize(),
         "client_url": f"http://{CONFIG['client']['host']}:{CONFIG['client']['port']}",
         "camera_agent": (
@@ -2071,9 +1913,6 @@ def abort_cycle(request: AbortCycleRequest):
         tube_type=request.tube_type,
         error_code=request.error_code,
     )
-
-    if newly_aborted:
-        service.send_com_result(cycle)
 
     return {
         "accepted": True,

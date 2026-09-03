@@ -2,7 +2,8 @@
 
 Từ bản gộp này, **một process duy nhất** (1 port `8080`) vừa chạy:
 
-- **AI Server**: nhận ảnh upload, chạy YOLO + ROI rules, gửi kết quả qua COM Arduino, Web GUI quan sát.
+- **AI Server**: nhận ảnh upload, chạy YOLO + ROI rules, gửi tín hiệu `'0'`
+  qua COM Arduino khi **Step 3 NG**, Web GUI quan sát.
 - **Camera Agent** (`camera_agent.py`): theo dõi thư mục ảnh camera (**network share** hoặc local),
   quản lý sequence Step 1→2→3, upload ảnh lên AI Server qua loopback,
   nhận webhook Step 1 FAIL để abort cycle + reset stream.
@@ -50,7 +51,9 @@ hoặc double-click `start_server.bat`.
     điền `root_path` (ví dụ `D:/JPG1`).
   - `ai_server.base_url` luôn là `http://127.0.0.1:8080` (loopback tới chính nó).
 - Section `client`: để `127.0.0.1:8080` (webhook Step 1 FAIL loopback).
-- `serial`: COM port của Arduino cắm vào máy này.
+- `serial`: COM port của Arduino cắm vào máy này. Logic đã đơn giản:
+  chỉ gửi ký tự `'0'` (kèm `\r\n`) khi **Step 3 NG** — không ACK, không CRC.
+  Sketch Arduino mẫu: `arduino/ng_signal_receiver.ino`.
 
 ## Build exe (PyInstaller — 1 exe duy nhất)
 
