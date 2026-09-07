@@ -1133,6 +1133,9 @@ class ArduinoSignalSender:
 # ============================================================
 
 class InspectionService:
+    # Chu ky chay thread don dep anh cu (30 phut / lan).
+    RETENTION_CHECK_INTERVAL_SEC = 1800
+
     def __init__(self, config: dict):
         self.config = config
 
@@ -1172,12 +1175,18 @@ class InspectionService:
             self.ng_dir = default_ng_dir
             self.ng_dir.mkdir(parents=True, exist_ok=True)
 
-        # File log STEP3 (CSV) cung dua ve thu muc NG khi cau hinh
-        # 'ng_dir'; khong cau hinh -> giu hanh vi cu (<base_dir>/logs).
-        if configured_ng_dir:
-            self.step3_log_dir = self.ng_dir / "logs"
-        else:
-            self.step3_log_dir = Path(storage_cfg["base_dir"]) / "logs"
+        # Log STEP3 (CSV) LUON luu o local (<base_dir>/logs); khi co
+        # 'storage.ng_dir' (share mang) thi ghi them ban sao len
+        # <ng_dir>/logs. Xem step3_log_dirs().
+        self.ng_dir_configured = bool(configured_ng_dir)
+
+        # Thoi han giu anh raw/annotated tren may local (ngay). Qua
+        # han, thread 'Image-Cleanup' se xoa anh cu di (ban sao anh
+        # NG + raw NG + log da duoc ghi len 'storage.ng_dir' tren
+        # mang truoc). Dat 0 trong config de tat don dep tu dong.
+        self.image_retention_days = int(
+            storage_cfg.get("image_retention_days", 1)
+        )
 
         self.database = InspectionDatabase(
             config["storage"]["database_path"]
@@ -1198,6 +1207,7 @@ class InspectionService:
 
         self.worker_thread: Optional[threading.Thread] = None
         self.monitor_thread: Optional[threading.Thread] = None
+        self.cleanup_thread: Optional[threading.Thread] = None
 
     def get_model_name(self) -> str:
         weights_path = str(self.config["model"]["weights"])
@@ -1234,6 +1244,18 @@ class InspectionService:
         )
         self.monitor_thread.start()
 
+        if self.image_retention_days > 0:
+            self.cleanup_thread = threading.Thread(
+                target=self.cleanup_loop,
+                name="Image-Cleanup",
+                daemon=True,
+            )
+            self.cleanup_thread.start()
+            LOGGER.info(
+                "Image cleanup enabled: retention=%s day(s)",
+                self.image_retention_days,
+            )
+
         LOGGER.info("Inspection service started")
 
     def stop(self) -> None:
@@ -1244,6 +1266,9 @@ class InspectionService:
 
         if self.monitor_thread:
             self.monitor_thread.join(timeout=5)
+
+        if self.cleanup_thread:
+            self.cleanup_thread.join(timeout=5)
 
         LOGGER.info("Inspection service stopped")
 
@@ -1495,7 +1520,8 @@ class InspectionService:
         event: dict,
     ) -> Optional[str]:
         """
-        Copy ket qua NG Step 3 sang thu muc NG (storage.ng_dir):
+        Copy ket qua NG/FAIL (Step 1 FAIL + Step 3 NG) sang thu muc NG
+        (storage.ng_dir):
         - Anh annotated (da ve khung + nhan): <cycle_id>/<stem>_annotated.jpg
         - Anh raw (ban goc camera upload):    <cycle_id>/<stem>.jpg
 
@@ -1559,48 +1585,132 @@ class InspectionService:
         except Exception as ex:
             LOGGER.error("Failed to save NG raw image: %s", ex)
 
-    def log_step3_csv(self, cycle: dict, event: dict) -> None:
-        try:
-            # Thu muc log da duoc quy dinh trong __init__:
-            # <ng_dir>/logs khi co 'storage.ng_dir', khong thi <base_dir>/logs.
-            log_dir = self.step3_log_dir
-            log_dir.mkdir(parents=True, exist_ok=True)
+    def cleanup_loop(self) -> None:
+        """
+        Thread don dep anh cu tren may local theo
+        'storage.image_retention_days' (mac dinh 1 ngay).
+        """
+        while not self.stop_event.is_set():
+            try:
+                self.cleanup_old_images()
+            except Exception:
+                LOGGER.exception("Image cleanup failed")
 
-            csv_path = log_dir / f"STEP3_log_{datetime.now().strftime('%Y-%m-%d')}.csv"
+            self.stop_event.wait(self.RETENTION_CHECK_INTERVAL_SEC)
 
-            write_header = not csv_path.exists()
+    def cleanup_old_images(self) -> None:
+        """
+        Xoa file anh (raw + annotated) cu hon 'image_retention_days'
+        ngay khoi may LOCAL, roi don cac thu muc tro nen rong.
 
-            # Tên file ảnh gốc do camera đặt; fallback về tên file
-            # ảnh gốc trên server ({event_id}.jpg) nếu thiếu.
-            image_name = (
-                event.get("original_filename")
-                or Path(event.get("image_path") or "").name
-                or ""
+        Ban sao anh NG + raw NG + log Step 3 da duoc ghi len
+        'storage.ng_dir' (share mang) nen viec xoa local khong lam
+        mat bang chung NG. File log CSV khong bao gio bi xoa tu dong.
+        """
+        if self.image_retention_days <= 0:
+            return
+
+        cutoff = time.time() - self.image_retention_days * 86400
+        deleted = 0
+
+        for root_dir in (self.raw_dir, self.annotated_dir):
+            if not root_dir.is_dir():
+                continue
+
+            for path in root_dir.rglob("*"):
+                try:
+                    if path.is_file() and path.stat().st_mtime < cutoff:
+                        path.unlink()
+                        deleted += 1
+                except OSError as ex:
+                    LOGGER.warning("Cleanup skip %s: %s", path, ex)
+
+            self._prune_empty_dirs(root_dir)
+
+        if deleted:
+            LOGGER.info(
+                "Image cleanup removed %s file(s) older than %s day(s)",
+                deleted,
+                self.image_retention_days,
             )
 
-            # Ảnh NG chỉ tồn tại khi Step 3 không OK (xem save_ng_screenshot).
-            ng_image_name = ""
-            if cycle.get("step3_status") not in (None, "", "OK"):
-                ng_stem = Path(image_name).stem if image_name else event.get("event_id", "")
-                ng_image_name = f"{ng_stem}_annotated.jpg"
+    def _prune_empty_dirs(self, root_dir: Path) -> None:
+        # Don tu trong ra ngoai; khong bao gio xoa goc (root_dir).
+        # Thu muc con rong lee se duoc don o chu ky sau.
+        for dirpath, dirnames, filenames in os.walk(
+            root_dir, topdown=False
+        ):
+            current = Path(dirpath)
 
-            with open(csv_path, "a", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                if write_header:
+            if current == root_dir:
+                continue
+
+            if not dirnames and not filenames:
+                try:
+                    current.rmdir()
+                except OSError:
+                    pass
+
+    def step3_log_dirs(self) -> list[Path]:
+        """
+        Danh sach thu muc ghi file log STEP3 (CSV):
+        - Local <base_dir>/logs: luon luon (ban sao tai may).
+        - <ng_dir>/logs: khi co 'storage.ng_dir' (ban sao len mang).
+        """
+        dirs = [Path(self.config["storage"]["base_dir"]) / "logs"]
+
+        if self.ng_dir_configured:
+            dirs.append(self.ng_dir / "logs")
+
+        return dirs
+
+    def log_step3_csv(self, cycle: dict, event: dict) -> None:
+        # Tên file ảnh gốc do camera đặt; fallback về tên file
+        # ảnh gốc trên server ({event_id}.jpg) nếu thiếu.
+        image_name = (
+            event.get("original_filename")
+            or Path(event.get("image_path") or "").name
+            or ""
+        )
+
+        # Ảnh NG chỉ tồn tại khi Step 3 không OK (xem save_ng_screenshot).
+        ng_image_name = ""
+        if cycle.get("step3_status") not in (None, "", "OK"):
+            ng_stem = Path(image_name).stem if image_name else event.get("event_id", "")
+            ng_image_name = f"{ng_stem}_annotated.jpg"
+
+        # Ghi log vao TAT CA cac dia (local + thu muc NG tren share).
+        # Loi ghi o mot dia khong anh huong dia con lai.
+        for log_dir in self.step3_log_dirs():
+            try:
+                log_dir.mkdir(parents=True, exist_ok=True)
+
+                csv_path = (
+                    log_dir
+                    / f"STEP3_log_{datetime.now().strftime('%Y-%m-%d')}.csv"
+                )
+
+                write_header = not csv_path.exists()
+
+                with open(csv_path, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    if write_header:
+                        writer.writerow([
+                            "datetime", "product_no", "image_name",
+                            "step3_result", "step3_error_code", "ng_image_name"
+                        ])
                     writer.writerow([
-                        "datetime", "product_no", "image_name",
-                        "step3_result", "step3_error_code", "ng_image_name"
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        cycle.get("tube_type", ""),
+                        image_name,
+                        cycle.get("step3_status", ""),
+                        cycle.get("step3_error", "NONE"),
+                        ng_image_name,
                     ])
-                writer.writerow([
-                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    cycle.get("tube_type", ""),
-                    image_name,
-                    cycle.get("step3_status", ""),
-                    cycle.get("step3_error", "NONE"),
-                    ng_image_name,
-                ])
-        except Exception as ex:
-            LOGGER.error("Failed to write STEP3 CSV: %s", ex)
+            except Exception as ex:
+                LOGGER.error(
+                    "Failed to write STEP3 CSV to %s: %s", log_dir, ex
+                )
 
     def process_event(self, event_id: str) -> None:
         event = self.database.get_image(event_id)
@@ -1647,9 +1757,15 @@ class InspectionService:
                 event=event,
             )
 
-            if step == 3 and not evaluation["passed"]:
+            # Ket qua NG/FAIL (Step 1 FAIL + Step 3 NG): copy anh
+            # annotated + raw sang thu muc NG (network share). Anh OK
+            # chi ton tai tren may local theo thoi han
+            # 'storage.image_retention_days' (xem cleanup_old_images).
+            if not evaluation["passed"]:
                 self.save_ng_screenshot(annotated_path, event)
-                self.signal_sender.send_ng_signal()
+
+                if step == 3:
+                    self.signal_sender.send_ng_signal()
 
             result_payload = {
                 "event_id": event_id,

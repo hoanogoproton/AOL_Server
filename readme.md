@@ -71,6 +71,13 @@ hoặc double-click `start_server.bat`.
   - Máy chạy server cần **quyền GHI** vào share (`net use` trước hoặc share
     cho phép ghi). Nếu share không truy cập được lúc khởi động, server
     **tự fallback** về `<base_dir>/ng` và ghi lỗi vào log — không bị chệt.
+- **Tự động dọn ảnh cũ (mới)**: ảnh raw + annotated (cả OK lẫn NG) vẫn được
+  lưu local như cũ, nhưng sau `storage.image_retention_days` ngày (mặc định
+  **1 ngày**) thread "Image-Cleanup" sẽ tự xóa file ảnh cũ + dọn thư mục rỗng
+  (chạy lại mỗi 30 phút). Bản sao **ảnh NG + raw NG (Step 1 FAIL / Step 3 NG)
+  + log Step 3** đã được ghi **kép** lên share `ng_dir` nên không mất bằng
+  chứng NG. Đặt `image_retention_days: 0` để tắt dọn dẹp. Log CSV không
+  bao giờ bị xóa tự động.
 - Section `camera_agent` (mới — cấu hình của Camera Agent):
   - Đọc ảnh qua **network share máy khác**: giữ mục `network_share`
     và điền `host`, `share`, `subfolder`, `username`, `password` thật.

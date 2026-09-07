@@ -42,6 +42,7 @@ client:
   port: 8181
 
 system:
+  com_retry_interval_sec: 2
   worker_count: 1
 
 camera_agent:

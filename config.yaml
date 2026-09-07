@@ -17,6 +17,11 @@ storage:
   #   <ng_dir>/<cycle_id>/<ten_anh>_annotated.jpg   (anh NG da annotate)
   #   <ng_dir>/<cycle_id>/<ten_anh>.jpg             (anh NG raw - ban goc)
   #   <ng_dir>/logs/STEP3_log_YYYY-MM-DD.csv        (file log Step 3)
+  # CHINH SACH LUU ANH: moi anh (OK + NG) deu luu local nhu cu; qua
+  #   'image_retention_days' ngay, thread cleanup se TU DONG XOA anh
+  #   cu tren local (raw_dir + annotated_dir). Ban sao anh NG + raw
+  #   NG + log da duoc ghi KEP len share nay nen khong mat bang
+  #   chung NG. Log CSV khong bao gio bi xoa tu dong.
   # Neu xoa muc nay hoac de gia tri rong -> ve mac dinh nhu cu:
   #   anh NG: <base_dir>/ng  ,  file log: <base_dir>/logs
   # LUU Y: may chay server phai co quyen GHI vao share nay
@@ -25,6 +30,10 @@ storage:
   #   local (<base_dir>/ng) va ghi loi vao log - khong bi chet.
   # ==========================================================
   ng_dir: '\\172.17.108.168\Anh AOL NG'
+
+  # So ngay giu anh tren may local truoc khi tu dong xoa (raw +
+  # annotated, ca OK lan NG). 0 = tat don dep (giu mai mai).
+  image_retention_days: 1
 
 model:
   weights: "./models/AOLv2.pt"
