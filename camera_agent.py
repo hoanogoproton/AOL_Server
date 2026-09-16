@@ -7,12 +7,14 @@ import os
 import queue
 import re
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
@@ -107,7 +109,7 @@ LOGGER = setup_logging()
 SAFE_COMPONENT_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 
 def observed_now_iso() -> str:
@@ -200,6 +202,26 @@ class CameraAgentDatabase:
             conn = self.connect()
 
             try:
+                # Migration: schema streams cu dung PK camera_side duy
+                # nhat (mot row / side, co cot active_no) - khong cho
+                # phep nhieu No chay song song. State stream la
+                # transient (auto_reset_on_startup) nen DROP la an toan.
+                existing_columns = {
+                    row["name"]
+                    for row in conn.execute(
+                        "PRAGMA table_info(streams)"
+                    ).fetchall()
+                }
+
+                if existing_columns and "tube_type" not in existing_columns:
+                    conn.execute("DROP TABLE streams")
+
+                    LOGGER.warning(
+                        "Migrated streams table: old side-key schema "
+                        "dropped, streams will be recreated per "
+                        "(camera_side, tube_type) lazily"
+                    )
+
                 conn.executescript(
                     """
                     CREATE TABLE IF NOT EXISTS meta (
@@ -208,9 +230,9 @@ class CameraAgentDatabase:
                     );
 
                     CREATE TABLE IF NOT EXISTS streams (
-                        camera_side TEXT PRIMARY KEY,
+                        camera_side TEXT NOT NULL,
+                        tube_type TEXT NOT NULL,
 
-                        active_no TEXT,
                         next_step INTEGER NOT NULL DEFAULT 1,
 
                         cycle_number INTEGER NOT NULL DEFAULT 0,
@@ -222,7 +244,9 @@ class CameraAgentDatabase:
                         last_file_path TEXT,
                         last_capture_timestamp TEXT,
 
-                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+                        PRIMARY KEY (camera_side, tube_type)
                     );
 
                     CREATE TABLE IF NOT EXISTS events (
@@ -274,19 +298,8 @@ class CameraAgentDatabase:
                     """
                 )
 
-                for side in ("L", "R"):
-                    conn.execute(
-                        """
-                        INSERT OR IGNORE INTO streams (
-                            camera_side,
-                            state,
-                            next_step,
-                            cycle_number
-                        )
-                        VALUES (?, 'OUT_OF_SYNC', 1, 0)
-                        """,
-                        (side,),
-                    )
+                # Khong seed row mac dinh: stream per (side, no) duoc
+                # tao lazily khi anh dau tien cua cap (side, no) den.
 
                 conn.commit()
 
@@ -431,7 +444,7 @@ class CameraAgentDatabase:
                     """
                     SELECT *
                     FROM streams
-                    ORDER BY camera_side
+                    ORDER BY camera_side, tube_type
                     """
                 ).fetchall()
 
@@ -473,7 +486,9 @@ class CameraAgentDatabase:
         auto_recover_out_of_sync: bool = True,
     ) -> dict:
         """
-        Gán file mới vào Step 1 / Step 2 / Step 3.
+        Gán file mới vào Step 1 / Step 2 / Step 3 theo stream riêng
+        của từng (camera_side, tube_type). Ảnh của No khác không còn
+        làm gián đoạn chu trình của No hiện tại.
 
         Return:
         {
@@ -523,14 +538,49 @@ class CameraAgentDatabase:
                     SELECT *
                     FROM streams
                     WHERE camera_side = ?
+                    AND tube_type = ?
                     """,
-                    (file_info.camera_side,),
+                    (
+                        file_info.camera_side,
+                        file_info.tube_type,
+                    ),
                 ).fetchone()
 
+                # Stream per (side, no) duoc tao lazily: cap chua tung
+                # co anh -> bat dau bang cycle moi (next_step=1,
+                # cycle_number=0), state RUNNING ngay.
                 if stream is None:
-                    raise RuntimeError(
-                        f"Stream not found: {file_info.camera_side}"
+                    conn.execute(
+                        """
+                        INSERT INTO streams (
+                            camera_side,
+                            tube_type,
+                            next_step,
+                            cycle_number,
+                            current_cycle_id,
+                            state,
+                            updated_at
+                        )
+                        VALUES (?, ?, 1, 0, NULL, 'RUNNING', CURRENT_TIMESTAMP)
+                        """,
+                        (
+                            file_info.camera_side,
+                            file_info.tube_type,
+                        ),
                     )
+
+                    stream = conn.execute(
+                        """
+                        SELECT *
+                        FROM streams
+                        WHERE camera_side = ?
+                        AND tube_type = ?
+                        """,
+                        (
+                            file_info.camera_side,
+                            file_info.tube_type,
+                        ),
+                    ).fetchone()
 
                 # Khi đang OUT_OF_SYNC, mặc định không được tự suy luận ảnh mới.
                 if stream["state"] != "RUNNING":
@@ -553,15 +603,17 @@ class CameraAgentDatabase:
                             "event": None,
                             "abort": None,
                             "message": (
-                                f"Camera {file_info.camera_side} is OUT_OF_SYNC. "
+                                f"Stream {file_info.camera_side}/"
+                                f"{file_info.tube_type} is OUT_OF_SYNC. "
                                 f"Manual reset required."
                             ),
                         }
 
                     LOGGER.warning(
-                        "Auto-recovered OUT_OF_SYNC side=%s now at step=1 "
-                        "cycle_number=%s",
+                        "Auto-recovered OUT_OF_SYNC side=%s no=%s now at "
+                        "step=1 cycle_number=%s",
                         file_info.camera_side,
+                        file_info.tube_type,
                         stream["cycle_number"],
                     )
 
@@ -571,14 +623,17 @@ class CameraAgentDatabase:
                         """
                         UPDATE streams
                         SET
-                            active_no = NULL,
                             next_step = 1,
                             current_cycle_id = NULL,
                             state = 'RUNNING',
                             updated_at = CURRENT_TIMESTAMP
                         WHERE camera_side = ?
+                        AND tube_type = ?
                         """,
-                        (file_info.camera_side,),
+                        (
+                            file_info.camera_side,
+                            file_info.tube_type,
+                        ),
                     )
 
                     stream = conn.execute(
@@ -586,91 +641,37 @@ class CameraAgentDatabase:
                         SELECT *
                         FROM streams
                         WHERE camera_side = ?
+                        AND tube_type = ?
                         """,
-                        (file_info.camera_side,),
+                        (
+                            file_info.camera_side,
+                            file_info.tube_type,
+                        ),
                     ).fetchone()
 
                     if stream is None:
                         raise RuntimeError(
-                            f"Stream not found: {file_info.camera_side}"
+                            f"Stream not found: "
+                            f"{file_info.camera_side}/{file_info.tube_type}"
                         )
 
                 next_step = int(stream["next_step"])
-                active_no = stream["active_no"]
                 current_cycle_id = stream["current_cycle_id"]
                 cycle_number = int(stream["cycle_number"])
 
-                abort_data = None
-
-                # Nếu đang giữa Step 1/2/3 mà No bị thay đổi:
-                # sequence không còn tin cậy.
-                if next_step != 1 and active_no != file_info.tube_type:
-                    if current_cycle_id:
-                        error_code = "E201_SEQUENCE_INTERRUPTED_NO_CHANGED"
-
-                        self.queue_abort(
-                            conn=conn,
-                            cycle_id=current_cycle_id,
-                            camera_side=file_info.camera_side,
-                            tube_type=active_no,
-                            error_code=error_code,
-                        )
-
-                        abort_data = {
-                            "cycle_id": current_cycle_id,
-                            "camera_side": file_info.camera_side,
-                            "tube_type": active_no,
-                            "error_code": error_code,
-                        }
-
-                    conn.execute(
-                        """
-                        UPDATE streams
-                        SET
-                            active_no = NULL,
-                            next_step = 1,
-                            current_cycle_id = NULL,
-                            state = 'OUT_OF_SYNC',
-                            updated_at = CURRENT_TIMESTAMP
-                        WHERE camera_side = ?
-                        """,
-                        (file_info.camera_side,),
-                    )
-
-                    conn.execute(
-                        """
-                        INSERT INTO seen_files (
-                            file_path,
-                            status
-                        )
-                        VALUES (?, 'BLOCKED_SEQUENCE_INTERRUPTED')
-                        """,
-                        (file_info.path,),
-                    )
-
-                    conn.commit()
-
-                    return {
-                        "status": "BLOCKED",
-                        "event": None,
-                        "abort": abort_data,
-                        "message": (
-                            f"No changed during incomplete cycle. "
-                            f"Camera {file_info.camera_side} is OUT_OF_SYNC."
-                        ),
-                    }
-
-                # Step 1 luôn bắt đầu cycle mới.
+                # Step 1 luôn bắt đầu cycle mới. Counter cycle tăng độc lập theo
+                # (camera_side, tube_type); tube_type nằm trong cycle_id
+                # để không trùng giữa các No trên cùng side.
                 if next_step == 1:
                     cycle_number += 1
 
                     cycle_id = (
                         f"{self.agent_id}-"
                         f"{file_info.camera_side}-"
+                        f"{file_info.tube_type}-"
                         f"{cycle_number:09d}"
                     )
 
-                    active_no = file_info.tube_type
                     assigned_step = 1
 
                 else:
@@ -727,24 +728,20 @@ class CameraAgentDatabase:
                 if assigned_step == 1:
                     new_next_step = 2
                     new_current_cycle_id = cycle_id
-                    new_active_no = active_no
 
                 elif assigned_step == 2:
                     new_next_step = 3
                     new_current_cycle_id = cycle_id
-                    new_active_no = active_no
 
                 else:
                     # Step 3 hoàn tất cycle.
                     new_next_step = 1
                     new_current_cycle_id = None
-                    new_active_no = None
 
                 conn.execute(
                     """
                     UPDATE streams
                     SET
-                        active_no = ?,
                         next_step = ?,
                         cycle_number = ?,
                         current_cycle_id = ?,
@@ -754,9 +751,9 @@ class CameraAgentDatabase:
                         last_capture_timestamp = ?,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE camera_side = ?
+                    AND tube_type = ?
                     """,
                     (
-                        new_active_no,
                         new_next_step,
                         cycle_number,
                         new_current_cycle_id,
@@ -764,6 +761,7 @@ class CameraAgentDatabase:
                         file_info.path,
                         file_info.observed_at,
                         file_info.camera_side,
+                        file_info.tube_type,
                     ),
                 )
 
@@ -864,17 +862,17 @@ class CameraAgentDatabase:
 
                 for row in rows:
                     cycle_id = row["current_cycle_id"]
-                    active_no = row["active_no"]
                     side = row["camera_side"]
+                    tube_type = row["tube_type"]
 
-                    if cycle_id and active_no:
+                    if cycle_id:
                         error_code = "E204_SEQUENCE_TIMEOUT"
 
                         self.queue_abort(
                             conn=conn,
                             cycle_id=cycle_id,
                             camera_side=side,
-                            tube_type=active_no,
+                            tube_type=tube_type,
                             error_code=error_code,
                         )
 
@@ -882,7 +880,7 @@ class CameraAgentDatabase:
                             {
                                 "cycle_id": cycle_id,
                                 "camera_side": side,
-                                "tube_type": active_no,
+                                "tube_type": tube_type,
                                 "error_code": error_code,
                             }
                         )
@@ -891,14 +889,14 @@ class CameraAgentDatabase:
                         """
                         UPDATE streams
                         SET
-                            active_no = NULL,
                             next_step = 1,
                             current_cycle_id = NULL,
                             state = 'OUT_OF_SYNC',
                             updated_at = CURRENT_TIMESTAMP
                         WHERE camera_side = ?
+                        AND tube_type = ?
                         """,
-                        (side,),
+                        (side, tube_type),
                     )
 
                 conn.commit()
@@ -911,10 +909,11 @@ class CameraAgentDatabase:
             finally:
                 conn.close()
 
-    def reset_stream(self, camera_side: str) -> Optional[dict]:
+    def reset_stream(self, camera_side: str) -> list[dict]:
         """
-        Reset thủ công do kỹ thuật viên thực hiện.
-        Ảnh tiếp theo sau reset sẽ được xem là Step 1.
+        Reset thủ công do kỹ thuật viên thực hiện: reset TẤT CẢ stream
+        của side này (mọi No). Ảnh tiếp theo sau reset sẽ được xem là
+        Step 1. Cycle nào đang dở của side bị queue abort E601.
         """
         if camera_side not in ("L", "R"):
             raise ValueError("camera_side must be L or R")
@@ -925,49 +924,45 @@ class CameraAgentDatabase:
             try:
                 conn.execute("BEGIN IMMEDIATE")
 
-                stream = conn.execute(
+                streams = conn.execute(
                     """
                     SELECT *
                     FROM streams
                     WHERE camera_side = ?
                     """,
                     (camera_side,),
-                ).fetchone()
+                ).fetchall()
 
-                if stream is None:
-                    raise RuntimeError(
-                        f"Stream not found: {camera_side}"
-                    )
+                aborts = []
 
-                abort_data = None
+                for stream in streams:
+                    if (
+                        stream["current_cycle_id"]
+                        and int(stream["next_step"]) != 1
+                    ):
+                        error_code = "E601_MANUAL_SEQUENCE_RESET"
 
-                if (
-                    stream["current_cycle_id"]
-                    and stream["active_no"]
-                    and int(stream["next_step"]) != 1
-                ):
-                    error_code = "E601_MANUAL_SEQUENCE_RESET"
+                        self.queue_abort(
+                            conn=conn,
+                            cycle_id=stream["current_cycle_id"],
+                            camera_side=camera_side,
+                            tube_type=stream["tube_type"],
+                            error_code=error_code,
+                        )
 
-                    self.queue_abort(
-                        conn=conn,
-                        cycle_id=stream["current_cycle_id"],
-                        camera_side=camera_side,
-                        tube_type=stream["active_no"],
-                        error_code=error_code,
-                    )
-
-                    abort_data = {
-                        "cycle_id": stream["current_cycle_id"],
-                        "camera_side": camera_side,
-                        "tube_type": stream["active_no"],
-                        "error_code": error_code,
-                    }
+                        aborts.append(
+                            {
+                                "cycle_id": stream["current_cycle_id"],
+                                "camera_side": camera_side,
+                                "tube_type": stream["tube_type"],
+                                "error_code": error_code,
+                            }
+                        )
 
                 conn.execute(
                     """
                     UPDATE streams
                     SET
-                        active_no = NULL,
                         next_step = 1,
                         current_cycle_id = NULL,
                         state = 'RUNNING',
@@ -981,7 +976,7 @@ class CameraAgentDatabase:
                 )
 
                 conn.commit()
-                return abort_data
+                return aborts
 
             except Exception:
                 conn.rollback()
@@ -1016,15 +1011,12 @@ class CameraAgentDatabase:
                     SELECT *
                     FROM streams
                     WHERE camera_side = ?
+                    AND current_cycle_id = ?
                     """,
-                    (camera_side,),
+                    (camera_side, expected_cycle_id),
                 ).fetchone()
 
                 if stream is None:
-                    conn.rollback()
-                    return None
-
-                if stream["current_cycle_id"] != expected_cycle_id:
                     conn.rollback()
                     return None
 
@@ -1032,7 +1024,6 @@ class CameraAgentDatabase:
                     """
                     UPDATE streams
                     SET
-                        active_no = NULL,
                         next_step = 1,
                         current_cycle_id = NULL,
                         state = 'RUNNING',
@@ -1041,8 +1032,9 @@ class CameraAgentDatabase:
                         last_capture_timestamp = NULL,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE camera_side = ?
+                    AND tube_type = ?
                     """,
-                    (camera_side,),
+                    (camera_side, stream["tube_type"]),
                 )
 
                 conn.commit()
@@ -1297,6 +1289,452 @@ class CameraFolderEventHandler(FileSystemEventHandler):
 
 
 # ============================================================
+# SMART SHARE POLLER
+# ============================================================
+
+# Thu muc co so entry khong vuot nguong nay duoc quet lai moi chu ky
+# (re_hat) de bat ca file bi ghi de tai cho; chi phi thap nen an toan.
+# Thu muc lon (hang nghin file) chi quet khi mtime cua no thay doi.
+CHEAP_DIR_MAX_ENTRIES = 64
+
+# Khoang nghi toi thieu giua hai chu ky cua poller (giay).
+POLLER_MIN_INTERVAL_SEC = 0.2
+
+
+@dataclass
+class _DirState:
+    """Trang thai da biet cua mot thu muc dang theo doi."""
+
+    mtime_ns: int = 0
+    scanned: bool = False
+    entry_count: int = 0
+
+    # file path - tuple (mtime_ns, size) tai lan quet gan nhat
+    files: dict = field(default_factory=dict)
+
+
+class SmartSharePoller:
+    """
+    Poller THEO TANG thay the PollingObserver quet toan cay recursive.
+
+    Van de cua PollingObserver tren share lon: moi chu ky no phai tao
+    DirectorySnapshot cua TOAN BO cay thu muc (stat tung file qua SMB)
+    roi so diff. Voi share hang tram GB / hang chuc nghin file, moi
+    vong quet keo dai hang phut, agent nhu "dung" va anh moi khong
+    duoc xu ly kip.
+
+    Cach lam cua poller nay:
+    - Moi chu ky: os.stat tung thu muc da biet (re) + os.scandir NHUNG
+      thu muc MOI / DOI mtime / thu muc nho (entry_count khong vuot
+      CHEAP_DIR_MAX_ENTRIES).
+    - KHONG quet lai cay lich su khong thay doi, nen chi phi moi chu
+      ky khong phu thuoc tong du lieu tren share.
+    - Chi emit file co mtime khong nho hon thoi diem start
+      (start_from_now theo tung folder) nen du lieu cu tren share
+      khong bi xu ly lai va KHONG can quet toan cay khi khoi dong.
+    - Gioi han so scandir moi chu ky (max_dir_scans_per_cycle) de mot
+      chu ky khong bao gio qua lau; phan con lai quet o chu ky sau.
+    - watch_current_day: chi theo doi folder hom nay + hom qua (theo
+      gio may Agent) ngay duoi root, bo qua cay ngay lich su khac.
+    """
+
+    def __init__(
+        self,
+        root_path: Path,
+        on_candidate,
+        poll_interval_sec: float = 2.0,
+        max_dir_scans_per_cycle: int = 32,
+        start_grace_sec: float = 0.0,
+        stop_event: Optional[threading.Event] = None,
+        watch_current_day: bool = False,
+        day_folder_format: str = "%Y-%m-%d",
+        now_fn=None,
+    ):
+        self.root_path = Path(root_path)
+        self.on_candidate = on_candidate
+
+        # Chi theo doi folder NGAY HIEN TAI ngay duoi root (vd
+        # 2026-09-11). Folder ngay lich su khong duoc track / stat
+        # -> chi phi SMB moi chu ky gan nhu khong phu thuoc so nam
+        # du lieu tren share. Sang ngay moi tu rollover state.
+        self.watch_current_day = bool(watch_current_day)
+        self.day_folder_format = str(day_folder_format)
+        self.now_fn = now_fn or datetime.now
+        self._day_name: Optional[str] = None
+        self.poll_interval_sec = max(
+            float(poll_interval_sec),
+            POLLER_MIN_INTERVAL_SEC,
+        )
+        self.max_dir_scans_per_cycle = max(
+            int(max_dir_scans_per_cycle),
+            1,
+        )
+
+        # Anh co mtime khong nho hon (start - start_grace_sec) moi
+        # duoc xu ly. start_grace_sec bu lech gio giua may Agent va
+        # may chu share.
+        grace_ns = int(
+            max(float(start_grace_sec), 0.0) * 1_000_000_000
+        )
+        self.start_ns = time.time_ns() - grace_ns
+
+        self.stop_event = stop_event or threading.Event()
+        self.dirs: dict = {}
+        self._thread: Optional[threading.Thread] = None
+        self.stats: dict = {
+            "cycles": 0,
+            "last_cycle_sec": 0.0,
+            "last_candidates": 0,
+            "deferred_dirs": 0,
+            "dirs_tracked": 0,
+            "day_folder": "",
+        }
+
+    # --------------------------------------------------------
+    # DAY FOLDER FILTER
+    # --------------------------------------------------------
+
+    def _watched_day_names(self, now: datetime) -> list:
+        """
+        Ten cac folder ngay duoc theo doi khi watch_current_day bat:
+        hom nay + hom qua (theo gio may Agent).
+
+        May chu share thuong lech gio so voi may Agent: khi gio may
+        camera cham hon, vua sau nua dem cua Agent camera van ghi vao
+        folder ngay cu trong vai gio -> phai theo doi them folder hom
+        qua neu khong se mat anh trong khung nay. Neu day_folder_format
+        khong phan biet theo ngay (vd chi "%H") thi hai ten trung nhau
+        -> chi con mot folder.
+        """
+        names = [now.strftime(self.day_folder_format)]
+
+        yesterday = (now - timedelta(days=1)).strftime(
+            self.day_folder_format
+        )
+
+        if yesterday not in names:
+            names.append(yesterday)
+
+        return names
+
+    # --------------------------------------------------------
+    # LIFECYCLE
+    # --------------------------------------------------------
+
+    def start(self):
+        if self._thread is not None:
+            return
+
+        self._thread = threading.Thread(
+            target=self._loop,
+            name="Share-Poller",
+            daemon=True,
+        )
+        self._thread.start()
+
+        day_note = ""
+
+        if self.watch_current_day:
+            day_note = " day_filter=%s" % ",".join(
+                str(self.root_path / name)
+                for name in self._watched_day_names(self.now_fn())
+            )
+
+        LOGGER.info(
+            "SmartSharePoller started. root=%s interval=%.1fs "
+            "max_dir_scans_per_cycle=%s%s",
+            self.root_path,
+            self.poll_interval_sec,
+            self.max_dir_scans_per_cycle,
+            day_note,
+        )
+
+    def stop(self, timeout: float = 5.0):
+        self.stop_event.set()
+
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+            self._thread = None
+
+        LOGGER.info("SmartSharePoller stopped")
+
+    def _loop(self):
+        while not self.stop_event.is_set():
+            started = time.monotonic()
+
+            try:
+                candidates = self._run_cycle()
+            except Exception:
+                LOGGER.exception("Smart share poller cycle error")
+                candidates = 0
+
+            elapsed = time.monotonic() - started
+
+            self.stats["cycles"] += 1
+            self.stats["last_cycle_sec"] = elapsed
+            self.stats["last_candidates"] = candidates
+            self.stats["dirs_tracked"] = len(self.dirs)
+
+            if candidates:
+                LOGGER.info(
+                    "Share poller: %s new/changed file(s) queued",
+                    candidates,
+                )
+
+            if max(self.poll_interval_sec * 5.0, 30.0) < elapsed:
+                LOGGER.warning(
+                    "Share poller cycle took %.1fs (interval=%.1fs) "
+                    "- xem xet tang max_dir_scans_per_cycle. "
+                    "dirs_tracked=%s",
+                    elapsed,
+                    self.poll_interval_sec,
+                    len(self.dirs),
+                )
+
+            self.stop_event.wait(self.poll_interval_sec)
+
+    # --------------------------------------------------------
+    # SCAN
+    # --------------------------------------------------------
+
+    def _run_cycle(self):
+        root_key = str(self.root_path)
+
+        if root_key not in self.dirs:
+            self.dirs[root_key] = _DirState()
+
+        if self.watch_current_day:
+            day_names = self._watched_day_names(self.now_fn())
+            today = day_names[0]
+            self.stats["day_folder"] = today
+
+            if today != self._day_name:
+                # Rollover nua dem: chi don state cua folder ngay khong
+                # con trong danh sach theo doi (hom nay + hom qua).
+                # State folder hom qua duoc giu lai de camera con ghi
+                # vao do sau nua dem cua Agent (gio may camera cham
+                # hon) khong bi mat, va ep quet lai root o chu ky nay.
+                if self._day_name is not None:
+                    LOGGER.info(
+                        "Share poller: day rollover %s -> %s, "
+                        "watch day folders: %s",
+                        self._day_name,
+                        today,
+                        ",".join(day_names),
+                    )
+
+                watched_keys = {
+                    str(self.root_path / name) for name in day_names
+                }
+
+                for known in list(self.dirs):
+                    if known == root_key:
+                        continue
+
+                    # Chi don nhanh cap 1 ngay duoi root ma khong con
+                    # duoc theo doi (kem toan bo subtree cua no). Giu
+                    # nguyen subtree cua folder hom nay + hom qua de
+                    # file da biet khong bi emit lai sau rollover.
+                    if (
+                        os.path.dirname(known) == root_key
+                        and known not in watched_keys
+                    ):
+                        self._prune_subtree(known)
+
+                root_info = self.dirs.get(root_key)
+
+                if root_info is not None:
+                    root_info.scanned = False
+
+                self._day_name = today
+
+            # 1 stat re: track folder hom nay + hom qua ngay khi camera
+            # tao no (khong cho mtime root doi). Chua co thi bo qua,
+            # track loop ben duoi tu loi khi folder xuat hien.
+            for day_name in day_names:
+                day_path = self.root_path / day_name
+                day_key = str(day_path)
+
+                if day_key in self.dirs:
+                    continue
+
+                try:
+                    st = os.stat(day_path)
+                except OSError:
+                    continue
+
+                if st is not None and stat.S_ISDIR(st.st_mode):
+                    self.dirs[day_key] = _DirState(
+                        mtime_ns=st.st_mtime_ns
+                    )
+
+        scan_first: deque = deque()
+        scan_later: deque = deque()
+
+        for path, info in list(self.dirs.items()):
+            try:
+                st = os.stat(path)
+            except OSError:
+                # Thu muc bi xoa / share mat ket noi tam thoi, don
+                # state. Chu ky sau tu discovery lai tu root. File da
+                # xu ly khong bi xu ly lai nho dedup trong database.
+                self._prune_subtree(path)
+                continue
+
+            if not stat.S_ISDIR(st.st_mode):
+                self._prune_subtree(path)
+                continue
+
+            if not info.scanned or st.st_mtime_ns != info.mtime_ns:
+                scan_first.append((path, st.st_mtime_ns))
+            elif info.entry_count <= CHEAP_DIR_MAX_ENTRIES:
+                scan_later.append((path, st.st_mtime_ns))
+
+        budget = self.max_dir_scans_per_cycle
+        candidates = 0
+        deferred = 0
+
+        for queue in (scan_first, scan_later):
+            while queue:
+                path, mtime_hint_ns = queue.popleft()
+
+                if budget <= 0:
+                    deferred += 1
+                    continue
+
+                budget -= 1
+
+                try:
+                    candidates += self._scan_dir(
+                        path,
+                        mtime_hint_ns,
+                        scan_first,
+                    )
+                except OSError as exc:
+                    LOGGER.warning(
+                        "Share poller: cannot scan dir %s: %s",
+                        path,
+                        exc,
+                    )
+
+        if deferred:
+            LOGGER.info(
+                "Share poller: %s dir(s) deferred to next cycle "
+                "(max_dir_scans_per_cycle=%s)",
+                deferred,
+                self.max_dir_scans_per_cycle,
+            )
+
+        self.stats["deferred_dirs"] = deferred
+
+        return candidates
+
+    def _scan_dir(self, path, mtime_hint_ns, discovered):
+        # Track ngay tu dau: neu scandir loi thi 'scanned' van False,
+        # chu ky sau tu quet lai.
+        info = self.dirs.setdefault(path, _DirState())
+
+        subdirs: list = []
+        files: list = []
+
+        # Tren Windows/SMB, entry.stat() doc tu cache cua directory
+        # listing nen khong ton them round trip mang.
+        with os.scandir(path) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        subdirs.append(
+                            (
+                                entry.path,
+                                entry.stat(
+                                    follow_symlinks=False
+                                ).st_mtime_ns,
+                            )
+                        )
+
+                    elif entry.is_file(follow_symlinks=False):
+                        st = entry.stat(follow_symlinks=False)
+                        files.append(
+                            (entry.path, st.st_mtime_ns, st.st_size)
+                        )
+
+                except OSError:
+                    continue
+
+        # watch_current_day: tai cap root chi nhan entry trung ten
+        # folder ngay duoc theo doi (hom nay + hom qua theo gio may
+        # Agent - bu lech gio may chu share) -> folder ngay lich su
+        # khac khong bao gio duoc track; prune o chu ky rollover tu
+        # don state sot lai.
+        if self.watch_current_day and path == str(self.root_path):
+            watched = set(self._watched_day_names(self.now_fn()))
+            subdirs = [
+                (sub_path, sub_mtime)
+                for sub_path, sub_mtime in subdirs
+                if os.path.basename(sub_path) in watched
+            ]
+
+        # Luu mtime TRUOC lan quet: neu co file ghi vao trong luc scan
+        # thi mtime thuc te se khac, chu ky sau tu quet lai (no-op).
+        info.mtime_ns = mtime_hint_ns
+        info.scanned = True
+
+        current_files: dict = {}
+        emitted = 0
+
+        for fpath, mtime_ns, size in files:
+            current_files[fpath] = (mtime_ns, size)
+
+            if info.files.get(fpath) == (mtime_ns, size):
+                continue
+
+            # start_from_now theo tung folder: bo qua file co mtime
+            # nho hon thoi diem start, du lieu lich su tren share
+            # khong bao gio bi xu ly lai.
+            if mtime_ns < self.start_ns:
+                continue
+
+            self.on_candidate(Path(fpath))
+            emitted += 1
+
+        info.files = current_files
+        info.entry_count = len(files) + len(subdirs)
+
+        listed = {sub_path for sub_path, _ in subdirs}
+
+        for sub_path, sub_mtime in subdirs:
+            sub_info = self.dirs.get(sub_path)
+
+            if sub_info is None:
+                self.dirs[sub_path] = _DirState(mtime_ns=sub_mtime)
+                discovered.append((sub_path, sub_mtime))
+                continue
+
+            if not sub_info.scanned or sub_info.mtime_ns != sub_mtime:
+                discovered.append((sub_path, sub_mtime))
+
+        # Thu muc con khong con trong listing, don luon state cay con.
+        for known in list(self.dirs):
+            if known == path:
+                continue
+
+            if os.path.dirname(known) == path and known not in listed:
+                self._prune_subtree(known)
+
+        return emitted
+
+    def _prune_subtree(self, path):
+        prefix = path.rstrip("\\/") + os.sep
+
+        for known in [
+            key
+            for key in self.dirs
+            if key == path or key.startswith(prefix)
+        ]:
+            self.dirs.pop(known, None)
+
+
+# ============================================================
 # CAMERA AGENT
 # ============================================================
 
@@ -1395,6 +1833,51 @@ class CameraAgent:
                 "agent.poll_interval_sec must be greater than 0"
             )
 
+        # ==================================================
+        # SMART POLLER - khac phuc agent "dung" khi network
+        # share co hang tram GB / hang chuc folder. Bat mac
+        # dinh khi poll_observer bat (share mang / UNC). Dat
+        # smart_poller: false trong config de quay lai co che
+        # PollingObserver quet toan cay (cach hoat dong cu).
+        # ==================================================
+        self.smart_poller_enabled = bool(
+            config["agent"].get("smart_poller", True)
+        )
+        self.use_smart_poller = (
+            self.poll_observer and self.smart_poller_enabled
+        )
+
+        self.max_dir_scans_per_cycle = int(
+            config["agent"].get("max_dir_scans_per_cycle", 32)
+        )
+
+        if self.max_dir_scans_per_cycle <= 0:
+            raise ValueError(
+                "agent.max_dir_scans_per_cycle must be "
+                "greater than 0"
+            )
+
+        self.start_grace_sec = float(
+            config["agent"].get("start_grace_sec", 0.0)
+        )
+
+        if self.start_grace_sec < 0:
+            raise ValueError(
+                "agent.start_grace_sec must not be negative"
+            )
+
+        # Chi theo doi folder ngay hien tai + hom qua ngay duoi root
+        # (vd 2026-09-11 + 2026-09-10) thay vi ca cay lich su: poller
+        # chi track 2 folder nay, tu rollover khi sang ngay moi.
+        # Giu folder hom qua de bu lech gio may chu share: camera
+        # con ghi vao folder ngay cu sau nua dem cua Agent.
+        self.watch_current_day = bool(
+            config["agent"].get("watch_current_day", False)
+        )
+        self.day_folder_format = str(
+            config["agent"].get("day_folder_format", "%Y-%m-%d")
+        )
+
         self.file_stable_sec = float(
             config["agent"]["file_stable_sec"]
         )
@@ -1449,6 +1932,7 @@ class CameraAgent:
         self.stop_event = threading.Event()
 
         self.observer: Any = None
+        self.share_poller: Any = None
         self.file_worker_thread: Optional[threading.Thread] = None
         self.reconcile_thread: Optional[threading.Thread] = None
         self.upload_thread: Optional[threading.Thread] = None
@@ -1594,6 +2078,56 @@ class CameraAgent:
         self.bootstrap_if_needed()
         self.auto_reset_streams()
 
+        if self.use_smart_poller:
+            # Share lon (network_share / UNC): dung
+            # SmartSharePoller thay cho PollingObserver quet
+            # toan cay recursive.
+            self.observer = None
+
+            self.share_poller = SmartSharePoller(
+                root_path=self.root_path,
+                on_candidate=self.add_candidate,
+                poll_interval_sec=self.poll_interval_sec,
+                max_dir_scans_per_cycle=(
+                    self.max_dir_scans_per_cycle
+                ),
+                start_grace_sec=self.start_grace_sec,
+                stop_event=self.stop_event,
+                watch_current_day=self.watch_current_day,
+                day_folder_format=self.day_folder_format,
+            )
+            self.share_poller.start()
+
+            LOGGER.info(
+                "Smart share poller enabled (PollingObserver "
+                "skipped). root=%s interval=%ss "
+                "max_dir_scans_per_cycle=%s",
+                self.root_path,
+                self.poll_interval_sec,
+                self.max_dir_scans_per_cycle,
+            )
+
+            # reconcile_loop quet rglob TOAN BO share - chi ap
+            # dung o che do cu; smart poller tu bu event theo
+            # tung folder.
+            self.reconcile_thread = None
+
+            LOGGER.info(
+                "Reconcile loop disabled "
+                "(smart share poller active)"
+            )
+
+            self._start_common_workers()
+
+            LOGGER.info(
+                "Camera Agent started (smart poller). "
+                "root=%s agent_id=%s",
+                self.root_path,
+                self.agent_id,
+            )
+
+            return
+
         event_handler = CameraFolderEventHandler(self)
 
         # Share qua mạng SMB/UNC không nhận event realtime
@@ -1648,8 +2182,33 @@ class CameraAgent:
             self.agent_id,
         )
 
+    def _start_common_workers(self):
+        self.file_worker_thread = threading.Thread(
+            target=self.file_worker_loop,
+            name="File-Worker",
+            daemon=True,
+        )
+        self.file_worker_thread.start()
+
+        self.upload_thread = threading.Thread(
+            target=self.upload_loop,
+            name="Upload-Worker",
+            daemon=True,
+        )
+        self.upload_thread.start()
+
+        self.timeout_thread = threading.Thread(
+            target=self.timeout_loop,
+            name="Timeout-Worker",
+            daemon=True,
+        )
+        self.timeout_thread.start()
+
     def stop(self) -> None:
         self.stop_event.set()
+
+        if self.share_poller:
+            self.share_poller.stop()
 
         if self.observer:
             self.observer.stop()
@@ -1689,6 +2248,28 @@ class CameraAgent:
 
         mode = self.config["agent"]["bootstrap_mode"]
 
+        # Smart poller tu ap dung start_from_now theo tung folder
+        # (chi nhan anh co mtime khong nho hon thoi diem start)
+        # nen KHONG can quet toan cay share khi khoi dong. Voi
+        # share hang tram GB / hang chuc nghin file, buoc rglob +
+        # mo tung file de doc magic bytes chinh la nguyen nhan
+        # server "dung" ngay sau buoc ket noi network share.
+        if self.use_smart_poller:
+            self.database.set_meta(
+                "bootstrap_initialized",
+                "true"
+            )
+
+            LOGGER.warning(
+                "Bootstrap skipped (smart poller active, "
+                "mode=%s). Old share files are ignored by "
+                "per-folder start_from_now - khong quet toan "
+                "cay khi khoi dong.",
+                mode,
+            )
+
+            return
+
         all_files = []
 
         for path in self.iter_image_files():
@@ -1719,14 +2300,16 @@ class CameraAgent:
 
     def auto_reset_streams(self) -> None:
         for side in ("L", "R"):
-            abort = self.database.reset_stream(side)
-            if abort:
+            aborts = self.database.reset_stream(side)
+
+            for abort in aborts:
                 LOGGER.warning(
                     "Auto-reset on startup side=%s aborted_cycle=%s",
                     side,
                     abort,
                 )
-            else:
+
+            if not aborts:
                 LOGGER.info(
                     "Auto-reset on startup side=%s (no active cycle)",
                     side,
@@ -1867,6 +2450,12 @@ class CameraAgent:
 
             event = result["event"]
 
+            if result.get("abort"):
+                LOGGER.error(
+                    "Abort queued: %s",
+                    result["abort"],
+                )
+
             LOGGER.info(
                 "Assigned file event=%s cycle=%s side=%s no=%s step=%s upload=%s",
                 event["event_id"],
@@ -1946,8 +2535,9 @@ class CameraAgent:
                 for stream in warnings:
                     LOGGER.warning(
                         "Sequence pending beyond step_timeout_sec side=%s "
-                        "cycle=%s step=%s idle_sec=%.1f",
+                        "no=%s cycle=%s step=%s idle_sec=%.1f",
                         stream["camera_side"],
+                        stream["tube_type"],
                         stream["current_cycle_id"],
                         stream["next_step"],
                         time.time() - (stream["last_event_unix"] or 0),
@@ -2158,18 +2748,18 @@ class CameraAgent:
     # --------------------------------------------------------
 
     def reset_sequence(self, camera_side: str) -> dict:
-        abort = self.database.reset_stream(camera_side)
+        aborts = self.database.reset_stream(camera_side)
 
         LOGGER.warning(
-            "Manual sequence reset side=%s abort=%s",
+            "Manual sequence reset side=%s aborted_cycles=%s",
             camera_side,
-            abort,
+            aborts,
         )
 
         return {
             "camera_side": camera_side,
             "reset": True,
-            "aborted_cycle": abort,
+            "aborted_cycles": aborts,
             "message": (
                 "Sequence reset complete. "
                 "The next new image will be treated as Step 1."

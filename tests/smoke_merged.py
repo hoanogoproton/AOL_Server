@@ -209,16 +209,16 @@ def main() -> int:
         print("\nSMOKE PASS SCENARIO: ALL OK")
         return 0
 
-    print("== 3. Doi Step 1 FAIL -> cycle ABORTED tren AI Server...")
+    print("== 3. Doi Step 1 FAIL -> cycle SKIP tren AI Server...")
     wait_for(
         lambda: any(
-            c["final_result"] == "ABORTED"
+            c["final_result"] == "SKIP"
             for c in get_cycles(base_url)
         ),
         timeout_sec=args.timeout,
-        desc="final_result == ABORTED (step1 fail)",
+        desc="final_result == SKIP (step1 fail)",
     )
-    print("   OK: cycle ABORTED")
+    print("   OK: cycle SKIP")
 
     print("== 4. Doi webhook loopback -> agent reset stream (next_step=1)...")
     wait_for(

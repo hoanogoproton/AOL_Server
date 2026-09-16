@@ -60,10 +60,7 @@ roi:
 sequence:
   # Nếu Step 1 đã đến mà không có Step 3 sau thời gian này:
   # server sẽ kết luận NG để fail-safe.
-  # Phải CAO HƠN cycle_timeout_sec của agent (1800s) một biên độ:
-  # fail-safe dài hạn do agent E204 đảm nhiệm (abort đúng No bị kẹt,
-  # không lan sang No khác). 1900 > 1800 tránh 2 cơ chế đua nhau NG.
-  server_cycle_timeout_sec: 1900
+  server_cycle_timeout_sec: 120
 
 serial:
   # Don gian: Step 3 NG -> gui ky tu '0' qua COM. Khong ACK, khong CRC.
@@ -92,7 +89,7 @@ camera_agent:
     agent_id: "CAM01"
 
     # Chỉ dùng khi TẮT network_share ở dưới (đọc thư mục local).
-    root_path: "D:\\JPG1"
+    root_path: "R:\\JPG1"
 
     # ==========================================================
     # SHARE MẠNG TỪ MÁY KHÁC (BẬT: đọc ảnh qua network share)
@@ -105,8 +102,13 @@ camera_agent:
     # LƯU Ý: password lưu plaintext -> hạn chế quyền đọc file
     #   config bằng NTFS ACL (chỉ tài khoản chạy Agent được đọc).
     # ==========================================================
-    network_share: null
-
+    network_share:
+      host: "172.17.164.106"                 # TODO: IP hoặc hostname máy chủ share
+      share: "jpg1"                        # TODO: tên share trên máy chủ
+      subfolder: ""                        # thư mục con trong share (để rỗng nếu không có)
+      username: '172.17.164.106\minh-duc'     # TODO: tài khoản (có thể DOMAIN\user)
+      password: 'duc20262'                 # TODO: mật khẩu - nên dùng NHÁY ĐƠN
+      poll_observer: true                  # SMB không hỗ trợ event realtime -> dùng polling
 
     # Chu ky quet (giay) cua Smart Poller tren share mang / UNC
     # (hoac cua PollingObserver neu smart_poller: false). Voi

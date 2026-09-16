@@ -42,14 +42,33 @@ hoặc double-click `start_server.bat`.
 | Webhook Step 1 FAIL (loopback) | POST /api/v1/inspection-result |
 | Abort cycle (agent tự gọi - loopback) | POST /api/v1/cycles/abort |
 
+## Tự mở trình duyệt khi server chạy thành công (mới)
+
+Chạy qua `run.py` (kể cả exe `AIInspectionServer.exe` built từ `run.py`),
+server **tự mở trình duyệt** trang Web UI `http://127.0.0.1:<port>/` ngay khi
+khởi chạy **thành công**:
+
+- Logic poll `http://127.0.0.1:<port>/health` (background thread) — chỉ mở khi
+  `/health` trả **200** (service + model đã start xong), không còn hack "chờ
+  8 giay" cua `start_server.bat` (mở khi server chua song / chet thi mo trang loi).
+- Luon mo qua **`127.0.0.1`** ke ca khi server listen `0.0.0.0`.
+- Server chua song sau **60 giay** (boot loi, port bi chiem) -> bo qua, khong mo trang loi.
+- Bật/tắt:
+  - Config: `server.open_browser: true` (mặc định) / `false` trong `config.yaml`.
+  - Env override (thắng config): `AI_OPEN_BROWSER=0` (tắt) hoặc `AI_OPEN_BROWSER=1` (bật).
+
 ## Xử lý sự cố: không mở được Web UI
 
 1. **Đúng địa chỉ là `http://127.0.0.1:8080`** (hoặc `http://localhost:8080`).
    Gõ nhầm IP khác (vd `172.0.0.1:8080`) sẽ không bao giờ mở được.
 2. `start_server.bat` đã **pin `config.yaml` và xóa override** `AI_CONFIG`/
-   `AI_PORT`/`AI_HOST` còn sót trong terminal (env sót kiểu này làm server
-   chạy nhầm config/port — ví dụ `config_ng_test.yaml` chạy ở port **8182**),
-   đồng thời **tự mở trình duyệt** sau ~8 giây.
+   `AI_PORT`/`AI_HOST`/`AI_OPEN_BROWSER` còn sót trong terminal (env sót kiểu
+   này làm server chạy nhầm config/port — ví dụ `config_ng_test.yaml` chạy ở
+   port **8182**).
+2b. Trình duyệt không tự mở → kiểm tra `server.open_browser` trong `config.yaml`
+   và env `AI_OPEN_BROWSER` (đặt `0` là tắt). Log có dòng
+   `Web UI tu dong mo` (đã mở) hoặc `bo qua viec tu mo trinh duyet`
+   (server chưa sống trong 60s — xem lỗi trong log phía trước).
 3. Từ bản này, Camera Agent lỗi (mất share, sai đường dẫn) **không làm sập
    server**: web UI vẫn mở, `/health` report `"camera_agent": null`, nguyên
    nhân nằm trong log với dòng `Camera Agent FAILED to start`.
@@ -85,6 +104,17 @@ hoặc double-click `start_server.bat`.
     điền `root_path` (ví dụ `D:/JPG1`). Thư mục này được **tự tạo** khi
     khởi động nếu chưa có (chỉ áp dụng cho path local; UNC/network share
     thì báo lỗi thay vì tự tạo).
+  - **Share lon (hang tram GB / hang chuc folder)**: tu ban nay
+    Agent dung **Smart Poller** (`smart_poller: true`, mac dinh
+    bat khi doc qua network share): chi quet folder moi / co
+    thay doi theo mtime, KHONG quet toan cay moi chu ky va
+    KHONG quet toan bo share khi khoi dong (bootstrap) nen
+    server len ngay, khong bi "dung". Chi phi khong phu thuoc
+    tong du lieu lich su tren share. Dat `smart_poller: false`
+    de quay lai co che cu (PollingObserver). Tham so lien quan:
+    `max_dir_scans_per_cycle` (gioi han so folder quet sau moi
+    chu ky), `start_grace_sec` (bu lech gio giua 2 may).
+
   - `ai_server.base_url` luôn là `http://127.0.0.1:8080` (loopback tới chính nó).
 - Section `client`: để `127.0.0.1:8080` (webhook Step 1 FAIL loopback).
 - `serial`: COM port của Arduino cắm vào máy này. Logic đã đơn giản:

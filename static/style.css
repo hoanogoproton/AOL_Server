@@ -318,6 +318,10 @@ body {
     background: rgba(96, 165, 250, 0.15);
     color: var(--accent-blue);
 }
+.tag-skip {
+    background: rgba(251, 191, 36, 0.15);
+    color: var(--accent-amber);
+}
 
 /* ============ MAIN CONTENT ============ */
 .main-content {
@@ -646,6 +650,7 @@ body {
 .result-chip.pending .chip-value { color: var(--accent-amber); }
 .result-chip.ok .chip-value { color: var(--accent-green); }
 .result-chip.ng .chip-value { color: var(--accent-red); }
+.result-chip.skip .chip-value { color: var(--accent-amber); }
 .chip-final .chip-value { font-size: 1.3rem; }
 
 .detail-error {

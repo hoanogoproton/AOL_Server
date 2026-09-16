@@ -218,6 +218,7 @@ function renderCycleList(cycles) {
 function getFinalTag(c) {
     if (!c.final_result) return '<span class="tag tag-pending">Pending</span>';
     if (c.final_result === 'OK') return '<span class="tag tag-ok">OK</span>';
+    if (c.final_result === 'SKIP' || c.final_result === 'ABORTED') return '<span class="tag tag-skip">SKIP</span>';
     if (c.com_status === 'ACK') return '<span class="tag tag-ack">ACK</span>';
     return '<span class="tag tag-ng">NG</span>';
 }
@@ -253,6 +254,9 @@ function renderCycleDetail(cycle, images) {
     if (cycle.final_result === 'OK') {
         finalChip.className = 'result-chip chip-final ok';
         finalVal.textContent = 'OK';
+    } else if (cycle.final_result === 'SKIP' || cycle.final_result === 'ABORTED') {
+        finalChip.className = 'result-chip chip-final skip';
+        finalVal.textContent = 'SKIP';
     } else if (cycle.final_result === 'NG') {
         finalChip.className = 'result-chip chip-final ng';
         finalVal.textContent = 'NG';

@@ -672,9 +672,11 @@ class InspectionDatabase:
                 step3_status = row["step3_status"]
 
                 if step1_status is not None and step1_status != "PASS":
-                    final_result = "NG"
+                    # Step 1 FAIL → SKIP, khong gui COM (nhung Edge: webhook fail,
+                    # Step 3 van den sau → van ghi SKIP + ABORTED cho dong bo)
+                    final_result = "SKIP"
                     final_error = row["step1_error"] or "E110_PRE_GLUE_FAIL"
-                    com_status = "PENDING"
+                    com_status = "ABORTED"
                 elif step1_status is None or step3_status is None:
                     conn.rollback()
                     return None
@@ -1007,7 +1009,7 @@ class InspectionDatabase:
                     """
                     UPDATE cycles
                     SET
-                        final_result = 'ABORTED',
+                        final_result = 'SKIP',
                         final_error = ?,
                         com_status = 'ABORTED',
                         com_updated_at = CURRENT_TIMESTAMP,
@@ -1808,7 +1810,7 @@ class InspectionService:
                 )
                 self.notify_client_step1_result(event, step_status, error_code)
                 LOGGER.info(
-                    "Step 1 FAIL, cycle ABORTED cycle=%s error=%s",
+                    "Step 1 FAIL, cycle SKIP cycle=%s error=%s",
                     event["cycle_id"],
                     error_code,
                 )
@@ -1877,7 +1879,7 @@ class InspectionService:
                 )
                 self.notify_client_step1_result(event, step_status, error_code)
                 LOGGER.info(
-                    "Step 1 FAIL (exception), cycle ABORTED cycle=%s error=%s",
+                    "Step 1 FAIL (exception), cycle SKIP cycle=%s error=%s",
                     event["cycle_id"],
                     error_code,
                 )
