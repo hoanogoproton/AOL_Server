@@ -486,9 +486,11 @@ class CameraAgentDatabase:
         auto_recover_out_of_sync: bool = True,
     ) -> dict:
         """
-        Gán file mới vào Step 1 / Step 2 / Step 3 theo stream riêng
+        Gán file mới vào Step 1 / Step 3 theo stream riêng
         của từng (camera_side, tube_type). Ảnh của No khác không còn
         làm gián đoạn chu trình của No hiện tại.
+
+        Chu trình 2 ảnh: ảnh 1 = Step 1, ảnh 2 = Step 3.
 
         Return:
         {
@@ -685,10 +687,8 @@ class CameraAgentDatabase:
 
                 event_id = f"{cycle_id}-S{assigned_step}"
 
-                if assigned_step == 2:
-                    upload_status = "SKIPPED_STEP2"
-                else:
-                    upload_status = "PENDING_UPLOAD"
+                # Moi event deu la Step 1 / Step 3 -> luon upload.
+                upload_status = "PENDING_UPLOAD"
 
                 conn.execute(
                     """
@@ -726,10 +726,7 @@ class CameraAgentDatabase:
                 )
 
                 if assigned_step == 1:
-                    new_next_step = 2
-                    new_current_cycle_id = cycle_id
-
-                elif assigned_step == 2:
+                    # Chu trinh 2 anh: sau Step 1 la Step 3.
                     new_next_step = 3
                     new_current_cycle_id = cycle_id
 
@@ -797,7 +794,7 @@ class CameraAgentDatabase:
     ) -> list[dict]:
         """
         Chỉ cảnh báo (không thay đổi trạng thái) các stream
-        đang chờ Step 2/3 quá thời gian cho phép.
+        đang chờ Step 3 quá thời gian cho phép.
         """
         warning_streams = []
         deadline = time.time() - warn_sec
@@ -811,7 +808,7 @@ class CameraAgentDatabase:
                     SELECT *
                     FROM streams
                     WHERE state = 'RUNNING'
-                    AND next_step IN (2, 3)
+                    AND next_step = 3
                     AND last_event_unix IS NOT NULL
                     AND last_event_unix < ?
                     """,
@@ -834,7 +831,7 @@ class CameraAgentDatabase:
         timeout_sec: float,
     ) -> list[dict]:
         """
-        Nếu đang chờ Step 2 hoặc Step 3 quá lâu:
+        Nếu đang chờ Step 3 quá lâu:
         - Cycle cũ bị abort.
         - Stream chuyển sang OUT_OF_SYNC.
         - Kỹ thuật viên cần reset thủ công.
@@ -853,7 +850,7 @@ class CameraAgentDatabase:
                     SELECT *
                     FROM streams
                     WHERE state = 'RUNNING'
-                    AND next_step IN (2, 3)
+                    AND next_step = 3
                     AND last_event_unix IS NOT NULL
                     AND last_event_unix < ?
                     """,

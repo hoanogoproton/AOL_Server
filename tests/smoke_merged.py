@@ -9,8 +9,9 @@ Cach dung:
        .\.venv\Scripts\python.exe tests\smoke_merged.py --scenario pass --base-url http://127.0.0.1:8180
        .\.venv\Scripts\python.exe tests\smoke_merged.py --scenario fail --base-url http://127.0.0.1:8181
 
-Scenario "pass": ghi 3 anh vao thu muc watch -> agent assign Step 1/2/3 ->
-upload loopback -> YOLO -> cycle OK (serial disabled: khong gui COM).
+Scenario "pass": ghi 2 anh vao thu muc watch -> agent assign Step 1 ->
+Step 3 -> upload loopback -> YOLO -> cycle OK (serial disabled: khong
+gui COM).
 
 Scenario "fail" (can server chay config_test_fail.yaml):
 anh Step 1 FAIL -> server webhook loopback /api/v1/inspection-result ->
@@ -125,18 +126,23 @@ def main() -> int:
     )
 
     streams = get_streams(base_url)
-    print(
-        "   stream L: state=%s next_step=%s"
-        % (streams["L"]["state"], streams["L"]["next_step"])
-    )
+    stream_l = streams.get("L")
+
+    if stream_l:
+        print(
+            "   stream L: state=%s next_step=%s"
+            % (stream_l["state"], stream_l["next_step"])
+        )
+    else:
+        print("   stream L: chua co (tao lazily khi anh dau tien den)")
 
     print("== 2. Ghi anh Step 1 vao thu muc watch...")
     write_image(watch_dir, args.tube, "L", "case_001.jpg")
 
     wait_for(
-        lambda: get_streams(base_url)["L"]["next_step"] == 2,
+        lambda: get_streams(base_url)["L"]["next_step"] == 3,
         timeout_sec=args.timeout,
-        desc="L chuyen next_step=2 (Step 1 assigned)",
+        desc="L chuyen next_step=3 (Step 1 assigned)",
     )
     print("   OK: Step 1 assigned")
 
@@ -152,18 +158,8 @@ def main() -> int:
         )
         print("   OK: Step 1 PASS")
 
-        print("== 4. Ghi anh Step 2...")
+        print("== 4. Ghi anh Step 3 (anh detect chinh)...")
         write_image(watch_dir, args.tube, "L", "case_002.jpg")
-
-        wait_for(
-            lambda: get_streams(base_url)["L"]["next_step"] == 3,
-            timeout_sec=args.timeout,
-            desc="L chuyen next_step=3 (Step 2 assigned)",
-        )
-        print("   OK: Step 2 assigned")
-
-        print("== 5. Ghi anh Step 3...")
-        write_image(watch_dir, args.tube, "L", "case_003.jpg")
 
         wait_for(
             lambda: get_streams(base_url)["L"]["next_step"] == 1,
@@ -172,7 +168,7 @@ def main() -> int:
         )
         print("   OK: Client-side hoan tat cycle")
 
-        print("== 6. Doi final_result=OK...")
+        print("== 5. Doi final_result=OK...")
         wait_for(
             lambda: any(
                 c["final_result"] == "OK"

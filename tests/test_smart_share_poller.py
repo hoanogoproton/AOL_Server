@@ -361,6 +361,14 @@ def test_watch_current_day_ignores_old_day_folders(tmp_path):
     write_image(yesterday_dir / "22" / "No.3" / "L" / "y_old.jpg")
     write_image(today_dir / "9" / "No.1" / "L" / "today_old.jpg")
 
+    # Anh vua ghi co the co mtime trung clock tick voi start_ns cua
+    # poller (do granularuty dong ho Windows) -> bi emit nham. Gia
+    # mtime qua khu de ket qua xac dinh.
+    age_path(old1 / "9" / "No.1" / "L" / "old1.jpg")
+    age_path(old2 / "10" / "No.2" / "R" / "old2.jpg")
+    age_path(yesterday_dir / "22" / "No.3" / "L" / "y_old.jpg")
+    age_path(today_dir / "9" / "No.1" / "L" / "today_old.jpg")
+
     poller, emitted = make_poller(
         root,
         watch_current_day=True,

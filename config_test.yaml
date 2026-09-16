@@ -1,0 +1,102 @@
+# ============================================================
+# CONFIG TEST (scenario pass) — KHONG DUNG DU LIEU THAT.
+# Server + agent chay port 8180, doc thu muc watch local
+# ./data/test/watch, ROI rules test cho anh den 1600x1200 PASS.
+# Chay: $env:AI_CONFIG="config_test.yaml"; .\.venv\Scripts\python.exe run.py
+# ============================================================
+
+server:
+  host: "0.0.0.0"
+  port: 8180
+  # Test khong mo trinh duyet.
+  open_browser: false
+
+storage:
+  base_dir: "./data/test/server"
+  raw_dir: "./data/test/server/raw"
+  annotated_dir: "./data/test/server/annotated"
+  database_path: "./data/test/server/inspection.db"
+
+  # Khong dat ng_dir: anh NG + log ve mac dinh <base_dir>/ng + <base_dir>/logs.
+
+  # Test: giu anh de xem ket qua, tat don dep.
+  image_retention_days: 0
+
+model:
+  weights: "./models/AOLv2.pt"
+  device: cpu
+  imgsz: 1280
+  min_predict_confidence: 0.4
+  iou_threshold: 0.45
+
+image:
+  expected_width: 1600
+  expected_height: 1200
+  reject_wrong_resolution: true
+
+roi:
+  csv_path: "./roi_rules_test_pass.csv"
+  bbox_rule: "center_inside_roi"
+
+sequence:
+  # Test: timeout nho de fail-safe nhanh neu co cycle loi.
+  server_cycle_timeout_sec: 120
+
+serial:
+  enabled: false
+  port: "COM3"
+  baudrate: 115200
+  retry_count: 3
+  retry_interval_sec: 0.2
+
+client:
+  host: "127.0.0.1"
+  port: 8180
+
+system:
+  worker_count: 1
+
+camera_agent:
+  agent:
+    agent_id: "CAMTEST"
+
+    # Thu muc watch local (tu tao khi khoi dong).
+    root_path: "./data/test/watch"
+
+    # Test doc local: khong dung share mang.
+    network_share: null
+
+    poll_interval_sec: 1.0
+    smart_poller: true
+    max_dir_scans_per_cycle: 32
+
+    # Test doc local, dong bo gio -> khong can bu lech.
+    start_grace_sec: 0
+
+    # Bat: quet root chi nhan folder ngay -> phai TAT cho test vi
+    # smoke test ghi anh theo <root>/<tube>/<side>/file.jpg.
+    watch_current_day: false
+
+    bootstrap_mode: "start_from_now"
+
+    file_stable_sec: 0.2
+    file_check_interval_sec: 0.1
+    reconcile_interval_sec: 5
+
+    step_timeout_sec: 500
+    cycle_timeout_sec: 1800
+    auto_recover_out_of_sync: true
+    auto_reset_on_startup: true
+
+  storage:
+    database_path: "./data/test/agent/camera_agent.db"
+    log_dir: "./data/test/agent/logs"
+
+  ai_server:
+    base_url: "http://127.0.0.1:8180"
+    upload_timeout_sec: 15
+    retry_interval_sec: 1
+
+  local_api:
+    host: "127.0.0.1"
+    port: 8180

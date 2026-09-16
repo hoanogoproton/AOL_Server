@@ -5,7 +5,8 @@ Từ bản gộp này, **một process duy nhất** (1 port `8080`) vừa chạy
 - **AI Server**: nhận ảnh upload, chạy YOLO + ROI rules, gửi tín hiệu `'0'`
   qua COM Arduino khi **Step 3 NG**, Web GUI quan sát.
 - **Camera Agent** (`camera_agent.py`): theo dõi thư mục ảnh camera (**network share** hoặc local),
-  quản lý sequence Step 1→2→3, upload ảnh lên AI Server qua loopback,
+  quản lý sequence Step 1→3 (**2 ảnh mỗi chu trình**: ảnh 1 = Step 1 mốc + detect bước 1,
+  ảnh 2 = detect chính Step 3), upload ảnh lên AI Server qua loopback,
   nhận webhook Step 1 FAIL để abort cycle + reset stream.
 
 ## Cài thư viện
