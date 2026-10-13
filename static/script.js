@@ -127,6 +127,7 @@ function setLiveResult(cls, text) {
 function renderLiveInfo(image, result) {
     const info = document.getElementById('liveInfo');
     const detections = result?.detections || [];
+    const classifiers = result?.classifiers || [];
     const evaluation = result?.evaluation || null;
     const errorCode = result?.error_code || image.error_code || '';
 
@@ -143,7 +144,7 @@ function renderLiveInfo(image, result) {
     const roiItems = (evaluation?.roi_results || []).map(r => `
         <div class="roi-item ${r.passed ? 'pass' : 'fail'}">
             <span class="roi-name">${r.roi_id}</span>
-            <span class="roi-count">${r.class_name} | count=${r.count} [${r.min_count}-${r.max_count}]</span>
+            <span class="roi-count">${formatClassifierLabel(r.part_name, r.class_name)} conf=${Number(r.confidence || 0).toFixed(2)}</span>
             <span class="roi-verdict">${r.passed ? 'PASS' : 'FAIL'}</span>
         </div>
     `).join('') || '<div class="info-empty">No ROI data</div>';
@@ -153,6 +154,7 @@ function renderLiveInfo(image, result) {
             <h3>Detections (${detections.length})</h3>
             <div class="live-detections">${detRows}</div>
         </div>
+        ${renderClassifierSection(classifiers)}
         <div class="info-section">
             <h3>ROI Evaluation</h3>
             <div class="roi-list">${roiItems}</div>
@@ -287,6 +289,7 @@ function renderCycleDetail(cycle, images) {
 
         const result = img.result || null;
         const detections = result?.detections || [];
+        const classifiers = result?.classifiers || [];
         const evaluation = result?.evaluation || null;
         const errorCode = result?.error_code || img.error_code || '';
 
@@ -309,6 +312,7 @@ function renderCycleDetail(cycle, images) {
                     </div>
                     <div class="image-info">
                         ${renderDetectionSection(detections)}
+                        ${renderClassifierSection(classifiers)}
                         ${renderRoiSection(evaluation)}
                         ${renderErrorSection(errorCode)}
                         ${renderImageMetaSection(img)}
@@ -369,6 +373,36 @@ function renderDetectionSection(detections) {
     `;
 }
 
+function renderClassifierSection(classifiers) {
+    if (!classifiers || !classifiers.length) {
+        return '';
+    }
+    const rows = classifiers.map(item => `
+        <tr>
+            <td colspan="2">${formatClassifierLabel(item.part_name, item.predicted_class)}</td>
+            <td>conf=${Number(item.confidence || 0).toFixed(2)}</td>
+        </tr>
+    `).join('');
+    return `
+        <div class="info-section">
+            <h3>Phan loai (${classifiers.length})</h3>
+            <table class="det-table">
+                <thead><tr><th colspan="2">Ket qua</th><th>Do tin cay</th></tr></thead>
+                <tbody>${rows}</tbody>
+            </table>
+        </div>
+    `;
+}
+
+function formatClassifierLabel(partName, predictedClass) {
+    const part = String(partName || '').toLowerCase();
+    const partLabel = part ? part.charAt(0).toUpperCase() + part.slice(1) : '';
+    const classLabel = String(predictedClass || '').trim();
+    if (!classLabel) return partLabel;
+    if (classLabel.toLowerCase().startsWith(part)) return classLabel;
+    return `${partLabel} ${classLabel}`.trim();
+}
+
 function renderRoiSection(evaluation) {
     if (!evaluation || !evaluation.roi_results || !evaluation.roi_results.length) {
         return `
@@ -381,7 +415,7 @@ function renderRoiSection(evaluation) {
     const items = evaluation.roi_results.map(r => `
         <div class="roi-item ${r.passed ? 'pass' : 'fail'}">
             <span class="roi-name">${r.roi_id}</span>
-            <span class="roi-count">${r.class_name} | count=${r.count} [${r.min_count}-${r.max_count}]</span>
+            <span class="roi-count">${formatClassifierLabel(r.part_name, r.class_name)} conf=${Number(r.confidence || 0).toFixed(2)}</span>
             <span class="roi-verdict">${r.passed ? 'PASS' : 'FAIL'}</span>
         </div>
     `).join('');

@@ -1,17 +1,24 @@
 """
 Test SmartSharePoller - khac phuc agent "dung" khi network share co
-hang tram GB / hang chuc folder:
+hang tram GB / hang chuc folder, kem chinh sach "chi xu ly anh
+xuat hien SAU khi khoi dong":
 
-- File ghi sau thoi diem start duoc phat hien (emit).
-- File co mtime nho hon start KHONG emit (start_from_now per folder).
+- Baseline theo ton-tai-khi-quet-lan-dau tung folder: LAN DAU quet
+  mot folder, toan bo file dang ton tai duoc ghi nhan la "da xu
+  ly", KHONG emit gi (bat ke mtime) -> du lieu cu khong bi xu ly
+  lai va khong phu thuoc lech gio may chu share (khong can
+  start_grace_sec).
+- File ghi vao SAU baseline duoc emit (ca khi mtime bi lech ve
+  qua khu vi clock skew cua may camera).
 - File moi them vao folder cu: chi file moi duoc emit.
 - Budget: so scandir moi chu ky gioi han, phan con lai chu ky sau.
 - Folder bi xoa: don state, chu ky sau khong con quet.
 - File bi ghi de (in-place) trong folder nho: phat hien nho quet re.
 - Share mat ket noi / root chua co: khong crash, chu ky sau thu lai.
-- CameraAgent.bootstrap_if_needed: smart poller bat - khong quet cay.
-- watch_current_day: chi theo doi folder hom nay + hom qua (theo gio
-  may Agent) ngay duoi root, bo qua cay ngay lich su khac, tu
+- CameraAgent.bootstrap_start_from_now: smart poller bat - khong
+  quet cay; legacy - danh dau file hien co o MOI lan start.
+- watch_current_day: chi theo doi folder hom nay + hom qua (theo
+  gio may Agent) ngay duoi root, bo qua cay ngay lich su khac, tu
   rollover nua dem, ho tro gio khong pad.
 """
 
@@ -61,21 +68,66 @@ def age_path(path, seconds=86400.0):
     os.utime(path, (old, old))
 
 
-def test_new_file_after_start_is_emitted(tmp_path):
+def test_file_present_before_first_cycle_is_not_emitted(tmp_path):
     root = tmp_path / "share"
-    (root / "T1" / "L").mkdir(parents=True)
+    target = root / "T1" / "L"
+    write_image(target / "a.jpg")
 
     poller, emitted = make_poller(root)
 
-    # Ghi file SAU khi tao poller, mtime khong nho hon start_ns.
-    write_image(root / "T1" / "L" / "a.jpg")
+    # Lan quet dau = baseline: file dang ton tai khong duoc emit,
+    # bat ke mtime (khong con phu thuoc clock skew).
+    assert poller._run_cycle() == 0
+    assert emitted == []
+
+    # File van duoc ghi nhan vao state de khong quet vo ich lan sau.
+    state = poller.dirs[str(target)]
+    assert state.scanned is True
+    assert str(target / "a.jpg") in state.files
+
+    assert poller._run_cycle() == 0
+    assert emitted == []
+
+
+def test_new_file_after_baseline_is_emitted(tmp_path):
+    root = tmp_path / "share"
+    target = root / "T1" / "L"
+    target.mkdir(parents=True)
+
+    poller, emitted = make_poller(root)
+
+    # Chu ky dau lap baseline (folder con trong).
+    assert poller._run_cycle() == 0
+    assert emitted == []
+
+    # Ghi file SAU baseline -> emit.
+    write_image(target / "a.jpg")
 
     assert poller._run_cycle() == 1
-    assert emitted == [root / "T1" / "L" / "a.jpg"]
+    assert emitted == [target / "a.jpg"]
 
     # Chu ky sau khong con gi moi, khong emit lap lai.
     assert poller._run_cycle() == 0
-    assert emitted == [root / "T1" / "L" / "a.jpg"]
+    assert emitted == [target / "a.jpg"]
+
+
+def test_new_file_with_skewed_mtime_after_baseline_is_emitted(tmp_path):
+    # May camera lech gio ~2h so voi may Agent: file ghi SAU baseline
+    # nhung mtime "trong qua khu" van phai duoc emit. Chinh la ly do
+    # bo start_grace_sec: baseline theo ton-tai-khi-quet-lan-dau,
+    # khong con loc theo mtime.
+    root = tmp_path / "share"
+    target = root / "T1" / "L"
+    target.mkdir(parents=True)
+
+    poller, emitted = make_poller(root)
+    assert poller._run_cycle() == 0
+
+    write_image(target / "skewed.jpg")
+    age_path(target / "skewed.jpg", seconds=7200.0)
+
+    assert poller._run_cycle() == 1
+    assert emitted == [target / "skewed.jpg"]
 
 
 def test_old_file_not_emitted_start_from_now(tmp_path):
@@ -116,7 +168,7 @@ def test_new_file_in_old_folder_only_new_emitted(tmp_path):
     assert poller._run_cycle() == 0
     assert emitted == []
 
-    # Camera ghi anh moi, mtime folder doi, chi file moi duoc emit.
+    # Camera ghi anh moi vao folder cu: chi file moi duoc emit.
     write_image(target / "new.jpg")
 
     assert poller._run_cycle() == 1
@@ -136,6 +188,28 @@ def test_budget_rotates_scans_across_cycles(tmp_path):
         max_dir_scans_per_cycle=2,
     )
 
+    # Lap baseline truoc: toan bo cay (root + 5 T + 5 L) duoc quet
+    # dan theo budget, khong emit gi vi chua co file.
+    for _ in range(20):
+        per_cycle = poller._run_cycle()
+
+        # Moi chu ky khong vuot budget.
+        assert per_cycle <= 2
+        assert emitted == []
+
+        states = [
+            poller.dirs.get(str(root / ("T%d" % i) / "L"))
+            for i in range(5)
+        ]
+
+        if all(
+            state is not None and state.scanned
+            for state in states
+        ):
+            break
+
+    # Ghi 5 file SAU baseline: moi chu ky khong vuot budget (moi
+    # file den tu 1 lan quet), phan con lai quet o chu ky sau.
     for i in range(5):
         write_image(root / ("T%d" % i) / "L" / "a.jpg")
 
@@ -161,7 +235,9 @@ def test_deleted_folder_is_pruned(tmp_path):
 
     poller, emitted = make_poller(root)
 
-    # Ghi file sau khi tao poller de mtime moi hon start_ns.
+    # Lap baseline truoc (cay con trong).
+    assert poller._run_cycle() == 0
+
     write_image(root / "T1" / "L" / "a.jpg")
     assert poller._run_cycle() == 1
 
@@ -182,7 +258,9 @@ def test_in_place_change_in_small_folder_detected(tmp_path):
 
     poller, emitted = make_poller(root)
 
-    # Ghi file sau khi tao poller de mtime moi hon start_ns.
+    # Lap baseline truoc (folder con trong).
+    assert poller._run_cycle() == 0
+
     write_image(root / "T1" / "L" / "a.jpg")
     assert poller._run_cycle() == 1
 
@@ -222,11 +300,19 @@ def test_root_missing_is_tolerated(tmp_path):
     (root / "T1" / "L").mkdir(parents=True)
     write_image(root / "T1" / "L" / "a.jpg")
 
+    # Root xuat hien lai: chu ky dau quet toan cay = baseline, file
+    # dang ton tai khong duoc emit.
+    assert poller._run_cycle() == 0
+    assert emitted == []
+
+    write_image(root / "T1" / "L" / "b.jpg")
+
     assert poller._run_cycle() == 1
+    assert emitted == [root / "T1" / "L" / "b.jpg"]
 
 
 # ------------------------------------------------------------
-# bootstrap_if_needed khi smart poller bat
+# bootstrap_start_from_now
 # ------------------------------------------------------------
 
 def make_bootstrap_agent(use_smart_poller):
@@ -244,34 +330,49 @@ def test_bootstrap_skipped_when_smart_poller_active(tmp_path):
 
     write_image(tmp_path / "T1" / "L" / "old.jpg")
 
-    agent.bootstrap_if_needed()
+    agent.bootstrap_start_from_now()
 
-    assert agent.database.meta["bootstrap_initialized"] == "true"
-    # Khong quet cay: khong file nao bi danh dau qua bootstrap.
+    # Khong quet cay: khong file nao bi danh dau qua bootstrap -
+    # poller tu lap baseline tung folder khi quet lan dau.
     assert agent.database.bootstrap_calls == []
 
 
-def test_bootstrap_skips_when_already_initialized(tmp_path):
-    agent = make_bootstrap_agent(use_smart_poller=True)
-    agent.database.meta["bootstrap_initialized"] = "true"
+def test_bootstrap_legacy_marks_existing_files_every_start(tmp_path):
+    agent = make_bootstrap_agent(use_smart_poller=False)
     agent.root_path = tmp_path
 
-    agent.bootstrap_if_needed()
+    write_image(tmp_path / "T1" / "L" / "old.jpg")
 
-    assert agent.database.meta["bootstrap_initialized"] == "true"
+    # Lan start thu nhat: danh dau file hien co BOOTSTRAP_IGNORED.
+    agent.bootstrap_start_from_now()
+
+    assert agent.database.bootstrap_calls == [
+        [str(tmp_path / "T1" / "L" / "old.jpg")]
+    ]
+
+    # Lan start thu 2 (DB da co bootstrap_initialized tu lan truoc):
+    # van quet va danh dau lai file hien co - bootstrap chay MOI LAN
+    # start (INSERT OR IGNORE nen idempotent), de file ghi trong luc
+    # agent TAT khong bi reconcile_loop re-add.
+    agent.database.meta["bootstrap_initialized"] = "true"
+
+    agent.bootstrap_start_from_now()
+
+    assert agent.database.bootstrap_calls == [
+        [str(tmp_path / "T1" / "L" / "old.jpg")],
+        [str(tmp_path / "T1" / "L" / "old.jpg")],
+    ]
 
 
-def test_bootstrap_old_path_no_walk_when_root_missing(tmp_path):
-    # use_smart_poller=False + root khong ton tai: rglob tra ve rong,
-    # khong goi bootstrap_files (FakeDatabase khong co method nay,
-    # neu code co goi se raise AttributeError va test fail).
+def test_bootstrap_legacy_no_walk_result_when_root_missing(tmp_path):
+    # use_smart_poller=False + root khong ton tai: rglob tra ve rong
+    # (loi doc thu muc duoc nuot trong iter_image_files), bootstrap_files
+    # van duoc goi voi danh sach rong.
     agent = make_bootstrap_agent(use_smart_poller=False)
     agent.root_path = tmp_path / "khong-ton-tai"
 
-    agent.bootstrap_if_needed()
+    agent.bootstrap_start_from_now()
 
-    assert agent.database.meta["bootstrap_initialized"] == "true"
-    # Nhanh cu: van goi bootstrap_files (rong vi root khong co).
     assert agent.database.bootstrap_calls == [[]]
 
 
@@ -321,6 +422,23 @@ def test_init_smart_poller_defaults_for_network_share(tmp_path):
     assert agent.share_poller is None
 
 
+def test_init_accepts_legacy_start_grace_sec(tmp_path):
+    # Config cu co start_grace_sec != 0 van phai parse duoc (deprecated,
+    # bi bo qua - chi log, khong crash).
+    config = make_full_config(
+        tmp_path,
+        {
+            "network_share": {"host": "h", "share": "s"},
+            "start_grace_sec": 7500,
+        },
+    )
+
+    agent = CameraAgent(config)
+
+    assert agent.start_grace_sec == 7500.0
+    assert agent.use_smart_poller is True
+
+
 def test_init_smart_poller_off_for_local_path(tmp_path):
     config = make_full_config(tmp_path)
 
@@ -361,9 +479,9 @@ def test_watch_current_day_ignores_old_day_folders(tmp_path):
     write_image(yesterday_dir / "22" / "No.3" / "L" / "y_old.jpg")
     write_image(today_dir / "9" / "No.1" / "L" / "today_old.jpg")
 
-    # Anh vua ghi co the co mtime trung clock tick voi start_ns cua
-    # poller (do granularuty dong ho Windows) -> bi emit nham. Gia
-    # mtime qua khu de ket qua xac dinh.
+    # Anh ghi TRUOC chu ky dau -> nam trong baseline cua tung folder,
+    # khong duoc emit (aging khong con can thiet nhung giu de ro rang
+    # day la du lieu cu).
     age_path(old1 / "9" / "No.1" / "L" / "old1.jpg")
     age_path(old2 / "10" / "No.2" / "R" / "old2.jpg")
     age_path(yesterday_dir / "22" / "No.3" / "L" / "y_old.jpg")
@@ -382,7 +500,7 @@ def test_watch_current_day_ignores_old_day_folders(tmp_path):
     assert not any("2026-09-09" in k for k in poller.dirs)
 
     # Folder hom qua van duoc track (camera gio cham hon co the con
-    # ghi vao do), nhung file cu hon start khong bi emit lai.
+    # ghi vao do), nhung file nam trong baseline khong bi emit lai.
     assert str(yesterday_dir) in poller.dirs
 
     l_state = poller.dirs[str(yesterday_dir / "22" / "No.3" / "L")]
@@ -391,7 +509,7 @@ def test_watch_current_day_ignores_old_day_folders(tmp_path):
         in l_state.files
     )
 
-    # Anh moi ghi vao folder hom qua SAU khi start -> emit.
+    # Anh moi ghi vao folder hom qua SAU baseline -> emit.
     write_image(yesterday_dir / "22" / "No.3" / "L" / "y_new.jpg")
 
     assert poller._run_cycle() == 1
@@ -429,16 +547,23 @@ def test_watch_current_day_folder_created_later(tmp_path):
     assert emitted == []
     assert not any("2026-09-11" in k for k in poller.dirs)
 
-    # Camera tao folder ngay + ghi anh: chu ky ke tiet lo va emit.
+    # Camera tao cay folder ngay moi (con trong): chu ky ke tiep lo
+    # va lap baseline cho toan bo chuoi folder.
     today_dir = root / "2026-09-11"
+    deep = today_dir / "9" / "No.1" / "L"
+    deep.mkdir(parents=True)
 
-    write_image(today_dir / "9" / "No.1" / "L" / "a.jpg")
+    assert poller._run_cycle() == 0
+    assert str(today_dir) in poller.dirs
+    assert str(deep) in poller.dirs
+
+    # Anh ghi vao SAU baseline -> emit binh thuong.
+    write_image(deep / "a.jpg")
 
     assert poller._run_cycle() == 1
     assert emitted == [
-        today_dir / "9" / "No.1" / "L" / "a.jpg",
+        deep / "a.jpg",
     ]
-    assert str(today_dir) in poller.dirs
 
 
 def test_watch_current_day_rollover_prunes_old_day_state(tmp_path):
@@ -456,12 +581,14 @@ def test_watch_current_day_rollover_prunes_old_day_state(tmp_path):
         now_fn=lambda: now_holder["now"],
     )
 
-    # Ghi file SAU khi tao poller de mtime khong nho hon start_ns.
+    # Lap baseline truoc (cay con trong, khong emit gi).
+    assert poller._run_cycle() == 0
+    assert str(day0) in poller.dirs
+    assert str(day1) in poller.dirs
+
     write_image(day1 / "9" / "No.1" / "L" / "night.jpg")
 
     assert poller._run_cycle() == 1
-    assert str(day1) in poller.dirs
-    assert str(day0) in poller.dirs
 
     # Sang ngay moi: state folder TRUOC hom qua (day0) bi don, folder
     # hom nay cu (day1 - gio la hom qua) van duoc giu de camera con
@@ -489,8 +616,16 @@ def test_watch_current_day_rollover_prunes_old_day_state(tmp_path):
         day1 / "9" / "No.1" / "L" / "after_midnight.jpg",
     ]
 
-    # Camera bat dau ghi vao folder ngay moi.
+    # Camera tao cay folder ngay moi (con trong) -> duoc baseline
+    # trong vong ~1 chu ky, anh ghi sau do moi duoc xu ly.
     day2 = root / "2026-09-12"
+    (day2 / "1" / "No.2" / "R").mkdir(parents=True)
+
+    for _ in range(5):
+        poller._run_cycle()
+
+        if str(day2 / "1" / "No.2" / "R") in poller.dirs:
+            break
 
     write_image(day2 / "1" / "No.2" / "R" / "morning.jpg")
 
@@ -524,10 +659,12 @@ def test_watch_current_day_tracks_yesterday_for_late_camera(tmp_path):
         now_fn=lambda: now_holder["now"],
     )
 
-    # Chu ky dau: track folder hom qua + hom nay (chua co file moi).
+    # Chu ky dau: track + baseline folder hom qua / hom nay (cay con
+    # trong, chua co file).
     assert poller._run_cycle() == 0
 
-    # Camera (van o ngay 09-11 theo gio cua no) ghi anh moi.
+    # Camera (van o ngay 09-11 theo gio cua no) ghi anh moi SAU
+    # baseline.
     write_image(yesterday_dir / "23" / "No.1" / "L" / "late.jpg")
 
     assert poller._run_cycle() == 1
@@ -556,12 +693,16 @@ def test_watch_current_day_deep_unpadded_hour_folder(tmp_path):
     )
 
     # Gio khong pad so 0 ("9" chu khong phai "09"): moi cap duoi
-    # folder ngay duoc poller kham pha dong nhu binh thuong.
+    # folder ngay duoc poller kham pha dong nhu binh thuong. Lap
+    # baseline tren cay con trong truoc khi anh dau tien den.
     deep = root / "2026-09-11" / "9" / "No.1" / "L"
+    deep.mkdir(parents=True)
+
+    assert poller._run_cycle() == 0
+    assert str(deep) in poller.dirs
 
     write_image(deep / "a.jpg")
 
     assert poller._run_cycle() == 1
     assert emitted == [deep / "a.jpg"]
-    assert str(deep) in poller.dirs
     assert poller._run_cycle() == 0

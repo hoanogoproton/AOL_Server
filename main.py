@@ -207,6 +207,16 @@ class Detection:
         return (self.y1 + self.y2) / 2.0
 
 
+@dataclass
+class ClassifierResult:
+    part_name: str
+    model_name: str
+    predicted_class: str
+    class_id: int
+    confidence: float
+    roi: dict
+
+
 # ============================================================
 # ROI RULE ENGINE
 # ============================================================
@@ -214,6 +224,8 @@ class Detection:
 class RoiRuleEngine:
     def __init__(self, csv_path: str):
         self.rules: list[RoiRule] = []
+        self.classifier_rules: list[dict] = []
+        self.is_classifier_rules = False
         self.load_rules(csv_path)
 
     @staticmethod
@@ -228,9 +240,35 @@ class RoiRuleEngine:
 
     def load_rules(self, csv_path: str) -> None:
         self.rules.clear()
+        self.classifier_rules.clear()
 
         with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
             reader = csv.DictReader(f)
+
+            if reader.fieldnames and "part_name" in reader.fieldnames:
+                self.is_classifier_rules = True
+                for row in reader:
+                    self.classifier_rules.append(
+                        {
+                            "inspection_step": row["inspection_step"].strip(),
+                            "roi_id": row["roi_id"].strip(),
+                            "part_name": row["part_name"].strip(),
+                            "model_name": row["model_name"].strip(),
+                            "model_path": row.get("model_path", "").strip(),
+                            "expected_class": row["expected_class"].strip(),
+                            "x_min": float(row["compare_x_min"]),
+                            "y_min": float(row["compare_y_min"]),
+                            "x_max": float(row["compare_x_max"]),
+                            "y_max": float(row["compare_y_max"]),
+                            "confidence": float(row["confidence"]),
+                        }
+                    )
+                LOGGER.info(
+                    "Loaded %s classifier ROI rules from %s",
+                    len(self.classifier_rules),
+                    csv_path,
+                )
+                return
 
             for row in reader:
                 self.rules.append(
@@ -252,6 +290,76 @@ class RoiRuleEngine:
                 )
 
         LOGGER.info("Loaded %s ROI rules from %s", len(self.rules), csv_path)
+
+    def get_classifier_rules(self, inspection_step: str) -> list[dict]:
+        return [
+            rule
+            for rule in self.classifier_rules
+            if rule["inspection_step"] == inspection_step
+        ]
+
+    def evaluate_classifiers(
+        self,
+        inspection_step: str,
+        results: list[ClassifierResult],
+    ) -> dict:
+        rules = self.get_classifier_rules(inspection_step)
+        if not rules:
+            raise RuntimeError(
+                f"Không tìm thấy classifier ROI rule cho step={inspection_step}"
+            )
+
+        result_by_part = {item.part_name: item for item in results}
+        roi_results = []
+        all_passed = True
+
+        for rule in rules:
+            prediction = result_by_part.get(rule["part_name"])
+            expected = rule["expected_class"]
+            passed = bool(
+                prediction
+                and self.class_names_match(prediction.predicted_class, expected)
+                and prediction.confidence >= rule["confidence"]
+            )
+            all_passed = all_passed and passed
+
+            roi_results.append(
+                {
+                    "roi_id": rule["roi_id"],
+                    "part_name": rule["part_name"],
+                    "class_name": prediction.predicted_class if prediction else "",
+                    "expected_class": expected,
+                    "confidence": prediction.confidence if prediction else 0.0,
+                    "confidence_threshold": rule["confidence"],
+                    "passed": passed,
+                    "roi": {
+                        "x_min": rule["x_min"],
+                        "y_min": rule["y_min"],
+                        "x_max": rule["x_max"],
+                        "y_max": rule["y_max"],
+                    },
+                }
+            )
+
+        return {
+            "inspection_step": inspection_step,
+            "model_name": "classifier_bundle",
+            "passed": all_passed,
+            "roi_results": roi_results,
+        }
+
+    @staticmethod
+    def class_names_match(actual: str, expected: str) -> bool:
+        def normalize(value: str) -> str:
+            return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+        actual_normalized = normalize(actual)
+        expected_normalized = normalize(expected)
+        if actual_normalized == expected_normalized:
+            return True
+
+        # Cho phep model tra ve "OK" trong khi rule ghi "Body OK".
+        return actual_normalized in {"ok", "ng"} and actual_normalized in expected_normalized
 
     def get_rules(self, inspection_step: str, model_name: str) -> list[RoiRule]:
         target_name = self.normalize_model_name(model_name)
@@ -1202,7 +1310,7 @@ class InspectionService:
             config["serial"]
         )
 
-        self.model: Optional[YOLO] = None
+        self.classifier_models: dict[str, YOLO] = {}
 
         self.job_queue: queue.Queue[str] = queue.Queue()
         self.stop_event = threading.Event()
@@ -1211,21 +1319,23 @@ class InspectionService:
         self.monitor_thread: Optional[threading.Thread] = None
         self.cleanup_thread: Optional[threading.Thread] = None
 
-    def get_model_name(self) -> str:
-        weights_path = str(self.config["model"]["weights"])
-        return Path(weights_path).stem
+    def get_classifier_specs(self) -> dict[str, dict]:
+        model_cfg = self.config.get("model", {})
+        classifiers = model_cfg.get("classifiers") or {}
+        if not classifiers:
+            raise RuntimeError("Chưa cấu hình model.classifiers")
+        return classifiers
 
     def start(self) -> None:
-        LOGGER.info("Loading YOLO model...")
-
-        self.model = YOLO(
-            self.config["model"]["weights"]
-        )
-
-        LOGGER.info(
-            "YOLO model loaded: %s",
-            self.config["model"]["weights"],
-        )
+        LOGGER.info("Loading classifier models...")
+        for part_name, model_spec in self.get_classifier_specs().items():
+            model_path = model_spec["weights"]
+            self.classifier_models[part_name] = YOLO(model_path)
+            LOGGER.info(
+                "Classifier model loaded: part=%s path=%s",
+                part_name,
+                model_path,
+            )
 
         pending_events = self.database.reset_processing_images()
 
@@ -1234,7 +1344,7 @@ class InspectionService:
 
         self.worker_thread = threading.Thread(
             target=self.worker_loop,
-            name="YOLO-Worker",
+            name="Classifier-Worker",
             daemon=True,
         )
         self.worker_thread.start()
@@ -1318,45 +1428,69 @@ class InspectionService:
 
             self.stop_event.wait(1.0)
 
-    def infer_detections(
-        self,
-        image_path: str,
-    ) -> tuple[list[Detection], object]:
-        if self.model is None:
-            raise RuntimeError("YOLO model chưa được load")
+    def infer_classifiers(self, image) -> list[ClassifierResult]:
+        if not self.classifier_models:
+            raise RuntimeError("Classifier models chưa được load")
 
         model_cfg = self.config["model"]
+        classifier_imgsz = int(model_cfg.get("classifier_imgsz", 224))
+        results: list[ClassifierResult] = []
 
-        results = self.model.predict(
-            source=image_path,
-            conf=float(model_cfg["min_predict_confidence"]),
-            iou=float(model_cfg["iou_threshold"]),
-            imgsz=int(model_cfg["imgsz"]),
-            device=model_cfg["device"],
-            verbose=False,
-        )
-
-        result = results[0]
-        detections: list[Detection] = []
-
-        if result.boxes is not None and len(result.boxes) > 0:
-            xyxy = result.boxes.xyxy.cpu().numpy()
-            confs = result.boxes.conf.cpu().numpy()
-            classes = result.boxes.cls.cpu().numpy()
-
-            for box, conf, cls_id in zip(xyxy, confs, classes):
-                detections.append(
-                    Detection(
-                        class_id=int(cls_id),
-                        confidence=float(conf),
-                        x1=float(box[0]),
-                        y1=float(box[1]),
-                        x2=float(box[2]),
-                        y2=float(box[3]),
-                    )
+        for rule in self.rule_engine.get_classifier_rules("STEP_1"):
+            part_name = rule["part_name"]
+            if part_name not in self.classifier_models:
+                raise RuntimeError(
+                    f"Chưa load classifier cho vùng {part_name}"
                 )
 
-        return detections, result
+            # Moi part chi can infer mot lan; STEP_3 dung cung ROI.
+            if any(item.part_name == part_name for item in results):
+                continue
+
+            height, width = image.shape[:2]
+            x_min = max(0, min(width, int(rule["x_min"])))
+            y_min = max(0, min(height, int(rule["y_min"])))
+            x_max = max(x_min + 1, min(width, int(rule["x_max"])))
+            y_max = max(y_min + 1, min(height, int(rule["y_max"])))
+            crop = image[y_min:y_max, x_min:x_max]
+            if crop.size == 0:
+                raise RuntimeError(
+                    f"ROI rỗng cho vùng {part_name}: {rule['roi_id']}"
+                )
+
+            prediction = self.classifier_models[part_name].predict(
+                source=crop,
+                imgsz=classifier_imgsz,
+                device=model_cfg["device"],
+                verbose=False,
+            )[0]
+
+            if prediction.probs is None:
+                raise RuntimeError(
+                    f"Model {part_name} không trả về kết quả classification"
+                )
+
+            class_id = int(prediction.probs.top1)
+            confidence = float(prediction.probs.top1conf)
+            class_name = str(prediction.names[class_id])
+
+            results.append(
+                ClassifierResult(
+                    part_name=part_name,
+                    model_name=rule["model_name"],
+                    predicted_class=class_name,
+                    class_id=class_id,
+                    confidence=confidence,
+                    roi={
+                        "x_min": rule["x_min"],
+                        "y_min": rule["y_min"],
+                        "x_max": rule["x_max"],
+                        "y_max": rule["y_max"],
+                    },
+                )
+            )
+
+        return results
 
     def validate_image_size(self, image) -> None:
         image_cfg = self.config["image"]
@@ -1410,7 +1544,7 @@ class InspectionService:
     def create_annotated_image(
         self,
         raw_image,
-        detections: list[Detection],
+        classifier_results: list[ClassifierResult],
         evaluation: dict,
         event: dict,
     ) -> str:
@@ -1429,49 +1563,25 @@ class InspectionService:
 
             cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
 
+            part_name = str(roi_result.get("part_name", "")).strip()
+            class_name = str(roi_result.get("class_name", "")).strip()
+            part_label = part_name.title()
+            if part_label and not class_name.lower().startswith(part_label.lower()):
+                class_label = f"{part_label} {class_name}".strip()
+            else:
+                class_label = class_name
+
             text = (
-                f"{roi_result['roi_id']} "
-                f"count={roi_result['count']} "
-                f"[{roi_result['min_count']}-{roi_result['max_count']}]"
+                f"{class_label} "
+                f"conf={roi_result.get('confidence', 0.0):.2f}"
             )
 
             cv2.putText(
                 image,
                 text,
-                (x1, max(25, y1 - 8)),
+                (x1 + 4, min(image.shape[0] - 8, y1 + 22)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
-                color,
-                2,
-                cv2.LINE_AA,
-            )
-
-        # Vẽ YOLO bbox.
-        for det in detections:
-            x1 = int(det.x1)
-            y1 = int(det.y1)
-            x2 = int(det.x2)
-            y2 = int(det.y2)
-
-            color_map = {0: (0, 0, 255), 1: (0, 200, 0)}
-            color = color_map.get(det.class_id, (255, 180, 0))
-
-            cv2.rectangle(
-                image,
-                (x1, y1),
-                (x2, y2),
-                color,
-                2,
-            )
-
-            label = f"class={det.class_id} conf={det.confidence:.3f}"
-
-            cv2.putText(
-                image,
-                label,
-                (x1, max(25, y1 - 5)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
                 color,
                 2,
                 cv2.LINE_AA,
@@ -1737,14 +1847,11 @@ class InspectionService:
 
             self.validate_image_size(raw_image)
 
-            detections, _ = self.infer_detections(
-                event["image_path"]
-            )
+            classifier_results = self.infer_classifiers(raw_image)
 
-            evaluation = self.rule_engine.evaluate(
+            evaluation = self.rule_engine.evaluate_classifiers(
                 inspection_step=inspection_step,
-                model_name=self.get_model_name(),
-                detections=detections,
+                results=classifier_results,
             )
 
             error_code = self.get_error_code(
@@ -1754,7 +1861,7 @@ class InspectionService:
 
             annotated_path = self.create_annotated_image(
                 raw_image=raw_image,
-                detections=detections,
+                classifier_results=classifier_results,
                 evaluation=evaluation,
                 event=event,
             )
@@ -1776,9 +1883,10 @@ class InspectionService:
                 "tube_type": event["tube_type"],
                 "step": step,
                 "processed_at": utc_now_iso(),
-                "detections": [
-                    asdict(det)
-                    for det in detections
+                "detections": [],
+                "classifiers": [
+                    asdict(result)
+                    for result in classifier_results
                 ],
                 "evaluation": evaluation,
                 "error_code": error_code,
@@ -2019,11 +2127,16 @@ def health():
         raise HTTPException(status_code=503, detail="Service not started")
 
     camera_agent_instance = camera_agent_module.camera_agent
+    classifier_specs = CONFIG.get("model", {}).get("classifiers", {})
+    model_paths = {
+        part_name: spec.get("weights", "")
+        for part_name, spec in classifier_specs.items()
+    }
 
     return {
         "status": "ok",
         "time": utc_now_iso(),
-        "model_path": CONFIG["model"]["weights"],
+        "model_paths": model_paths,
         "serial_enabled": CONFIG["serial"]["enabled"],
         "serial_connected": service.signal_sender.is_connected(),
         "queue_size": service.job_queue.qsize(),

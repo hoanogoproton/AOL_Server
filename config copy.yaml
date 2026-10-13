@@ -124,10 +124,13 @@ camera_agent:
     #   - stat tung folder da biet (re),
     #   - quet sau folder MOI / DOI (mtime doi) / folder nho,
     #   - khong bao gio quet lai du lieu lich su khong doi.
-    # Chi xu ly anh co mtime khong nho hon thoi diem start
-    # (start_from_now theo tung folder) nen anh cu tren share
-    # khong bi xu ly lai, va server khoi dong ngay lap tuc
-    # (khong quet toan cay share khi start).
+    # Baseline theo ton-tai-khi-quet-lan-dau tung folder: LAN DAU
+    # quet mot folder, toan bo file dang ton tai duoc coi la "da
+    # xu ly" (khong emit gi, bat ke mtime); cac lan sau chi emit
+    # file moi hoac bi ghi de sau baseline. Du lieu cu tren share
+    # khong bi xu ly lai va KHONG phu thuoc lech gio giua cac may,
+    # server khoi dong ngay lap tuc (khong quet toan cay share
+    # khi start).
     # Dat false de quay lai PollingObserver quet toan cay (cu).
     # ======================================================
     smart_poller: true
@@ -136,15 +139,12 @@ camera_agent:
     # bao gio qua lau; thu muc con lai quet o chu ky ke tiep.
     max_dir_scans_per_cycle: 32
 
-    # Bu lech gio (giay) giua may Agent va may chu share: anh co
-    # mtime khong nho hon (start - gia tri nay) van duoc nhan.
-    # De 0 neu 2 may dong bo gio qua NTP.
-    #
-    # 7500 (~2h + du): may chu share (camera AOI) lech ~2h so voi
-    # may Agent (anh 11h20 theo gio camera co mtime chi la 9h20 ben
-    # may Agent). Neu de 0, trong ~2h dau sau moi lan restart Agent,
-    # moi anh moi co mtime "trong qua khu" se bi bo qua
-    # (start_from_now) -> thieu Step 1/3 -> NG fail-safe.
+    # DEPRECATED - khong con dung (giu lai de config cu khong bi
+    # loi). Truoc day day la bu lech gio giua may Agent va may chu
+    # share de loc anh theo mtime. Gio poller baseline theo
+    # ton-tai-khi-quet-lan-dau tung folder (khong loc theo mtime)
+    # nen lech gio may chu share khong con anh huong: gia tri nay
+    # bi bo qua, chi duoc log lai mot lan khi khoi dong neu khac 0.
     start_grace_sec: 7500
 
     # ======================================================
@@ -159,15 +159,19 @@ camera_agent:
     # folder TRUOC hom qua, khong can restart. Tat di (false) de
     # quay lai theo doi toan cay.
     # LUU Y: folder ngay phai nam ngay duoi root; gio may Agent
-    # lam chuan khi quyet dinh folder nao duoc theo doi.
+    # lam chuan khi quyet dinh folder nao duoc theo doi. Lan quet
+    # dau tung folder chi lap baseline (khong emit file cu) - chi
+    # anh ghi vao SAU baseline moi duoc xu ly.
     # ======================================================
     watch_current_day: true
     day_folder_format: "%Y-%m-%d"
 
-    # Chi dung lan dau cai Agent (voi co che cu). Khi smart
-    # poller bat: khong quet toan cay khi khoi dong, anh co
-    # mtime nho hon thoi diem start tu dong bi bo qua
-    # (start_from_now theo tung folder).
+    # Chot "anh dang ton tai tai luc start = da xu ly" o moi LAN
+    # khoi dong. Legacy (root local / smart_poller: false): moi lan
+    # start deu quet danh sach file hien co duoi root (chi stat,
+    # khong doc noi dung) va danh dau BOOTSTRAP_IGNORED de
+    # reconcile_loop khong re-add. Khi smart poller bat: khong quet
+    # - poller tu lap baseline tung folder khi quet lan dau.
     bootstrap_mode: "start_from_now"
 
     # File phải giữ nguyên dung lượng ít nhất khoảng thời gian này

@@ -156,3 +156,5 @@ $env:AI_CONFIG="config_test_fail.yaml"; .\.venv\Scripts\python.exe run.py   # li
 > ⚠️ Khi deploy exe: `server.port` trong `config.yaml` phải trùng với port exe đang
 > lắng nghe (đã là 8080 mặc định) vì agent upload/webhook đều đi qua port đó.
 > Build lại exe sau khi có bản `run.py` mới (tự đọc port từ config).
+
+Cat anh thu muc: .\.venv\Scripts\python.exe tools\crop_rois.py --input-dir D:\AnhGoc --csv roi_rules.csv --output-dir D:\AnhDaCat

@@ -1326,9 +1326,12 @@ class SmartSharePoller:
       CHEAP_DIR_MAX_ENTRIES).
     - KHONG quet lai cay lich su khong thay doi, nen chi phi moi chu
       ky khong phu thuoc tong du lieu tren share.
-    - Chi emit file co mtime khong nho hon thoi diem start
-      (start_from_now theo tung folder) nen du lieu cu tren share
-      khong bi xu ly lai va KHONG can quet toan cay khi khoi dong.
+    - Baseline theo ton-tai-khi-quet-lan-dau tung folder: LAN DAU
+      quet mot thu muc, toan bo file dang ton tai duoc ghi nhan la
+      "da xu ly", KHONG emit gi (bat ke mtime). Cac lan quet sau chi
+      emit file MOI hoac bi ghi de sau baseline. Nho vay du lieu cu
+      tren share khong bi xu ly lai va KHONG phu thuoc lech gio
+      (clock skew) giua may chu share va may Agent.
     - Gioi han so scandir moi chu ky (max_dir_scans_per_cycle) de mot
       chu ky khong bao gio qua lau; phan con lai quet o chu ky sau.
     - watch_current_day: chi theo doi folder hom nay + hom qua (theo
@@ -1341,7 +1344,6 @@ class SmartSharePoller:
         on_candidate,
         poll_interval_sec: float = 2.0,
         max_dir_scans_per_cycle: int = 32,
-        start_grace_sec: float = 0.0,
         stop_event: Optional[threading.Event] = None,
         watch_current_day: bool = False,
         day_folder_format: str = "%Y-%m-%d",
@@ -1366,14 +1368,6 @@ class SmartSharePoller:
             int(max_dir_scans_per_cycle),
             1,
         )
-
-        # Anh co mtime khong nho hon (start - start_grace_sec) moi
-        # duoc xu ly. start_grace_sec bu lech gio giua may Agent va
-        # may chu share.
-        grace_ns = int(
-            max(float(start_grace_sec), 0.0) * 1_000_000_000
-        )
-        self.start_ns = time.time_ns() - grace_ns
 
         self.stop_event = stop_event or threading.Event()
         self.dirs: dict = {}
@@ -1631,6 +1625,12 @@ class SmartSharePoller:
         # chu ky sau tu quet lai.
         info = self.dirs.setdefault(path, _DirState())
 
+        # Lan dau quet thu muc = baseline: moi file dang ton tai duoc
+        # coi la "da xu ly" (khong emit). Neu da tung quet (ca truong
+        # hop ep quet lai sau rollover thi state file van con) thi
+        # chay so diff binh thuong.
+        was_scanned = info.scanned or bool(info.files)
+
         subdirs: list = []
         files: list = []
 
@@ -1682,13 +1682,13 @@ class SmartSharePoller:
         for fpath, mtime_ns, size in files:
             current_files[fpath] = (mtime_ns, size)
 
-            if info.files.get(fpath) == (mtime_ns, size):
+            # Baseline lan dau: ghi nhan toan bo file hien co, khong
+            # emit gi - bat ke mtime (du lieu cu tren share khong bi
+            # xu ly lai, khong phai bu lech gio may chu share).
+            if not was_scanned:
                 continue
 
-            # start_from_now theo tung folder: bo qua file co mtime
-            # nho hon thoi diem start, du lieu lich su tren share
-            # khong bao gio bi xu ly lai.
-            if mtime_ns < self.start_ns:
+            if info.files.get(fpath) == (mtime_ns, size):
                 continue
 
             self.on_candidate(Path(fpath))
@@ -1854,6 +1854,11 @@ class CameraAgent:
                 "greater than 0"
             )
 
+        # DEPRECATED - khong con dung. Baseline theo ton-tai-khi-
+        # quet-lan-dau tung folder (SmartSharePoller) va bootstrap
+        # every-start (legacy) da thay the loc theo mtime, nen lech
+        # gio may chu share khong con anh huong. Van parse de config
+        # cu khong crash; gia tri khac 0 chi duoc log lai mot lan.
         self.start_grace_sec = float(
             config["agent"].get("start_grace_sec", 0.0)
         )
@@ -1861,6 +1866,14 @@ class CameraAgent:
         if self.start_grace_sec < 0:
             raise ValueError(
                 "agent.start_grace_sec must not be negative"
+            )
+
+        if self.start_grace_sec:
+            LOGGER.info(
+                "agent.start_grace_sec=%s is deprecated and ignored: "
+                "baseline-by-existence at startup replaces the mtime "
+                "filter (share clock skew no longer matters).",
+                self.start_grace_sec,
             )
 
         # Chi theo doi folder ngay hien tai + hom qua ngay duoi root
@@ -2072,7 +2085,7 @@ class CameraAgent:
         self.connect_network_share()
         self.ensure_root_path()
 
-        self.bootstrap_if_needed()
+        self.bootstrap_start_from_now()
         self.auto_reset_streams()
 
         if self.use_smart_poller:
@@ -2088,7 +2101,6 @@ class CameraAgent:
                 max_dir_scans_per_cycle=(
                     self.max_dir_scans_per_cycle
                 ),
-                start_grace_sec=self.start_grace_sec,
                 stop_event=self.stop_event,
                 watch_current_day=self.watch_current_day,
                 day_folder_format=self.day_folder_format,
@@ -2235,64 +2247,57 @@ class CameraAgent:
         except Exception:
             LOGGER.exception("Error while scanning root folder")
 
-    def bootstrap_if_needed(self) -> None:
-        initialized = self.database.get_meta(
-            "bootstrap_initialized"
-        )
+    def bootstrap_start_from_now(self) -> None:
+        """
+        Chot "moi file dang ton tai tai luc start = da xu ly" de
+        du lieu cu khong bao gio bi xu ly lai:
 
-        if initialized == "true":
-            return
+        - Smart poller bat: bo qua - poller tu lap baseline theo
+          ton-tai-khi-quet-lan-dau tung folder, khong can quet cay.
+        - Legacy (PollingObserver + reconcile_loop): MOI LAN start
+          deu quet rglob toan bo file duoi root (chi stat, khong doc
+          noi dung file) va danh dau BOOTSTRAP_IGNORED. INSERT OR
+          IGNORE nen idempotent, chi ton chi phi stat.
 
+        Goi truoc khi bat Observer/poller trong start() de khong con
+        khoang thoi gian lo: file tao sau buoc nay duoc Observer
+        bat qua event on_created.
+        """
         mode = self.config["agent"]["bootstrap_mode"]
 
-        # Smart poller tu ap dung start_from_now theo tung folder
-        # (chi nhan anh co mtime khong nho hon thoi diem start)
-        # nen KHONG can quet toan cay share khi khoi dong. Voi
-        # share hang tram GB / hang chuc nghin file, buoc rglob +
-        # mo tung file de doc magic bytes chinh la nguyen nhan
-        # server "dung" ngay sau buoc ket noi network share.
+        # Smart poller tu lap baseline tung folder khi khoi dong.
+        # Voi share hang tram GB / hang chuc nghin file, buoc rglob
+        # toan cay chinh la nguyen nhan server "dung" ngay sau buoc
+        # ket noi network share.
         if self.use_smart_poller:
-            self.database.set_meta(
-                "bootstrap_initialized",
-                "true"
-            )
-
             LOGGER.warning(
                 "Bootstrap skipped (smart poller active, "
-                "mode=%s). Old share files are ignored by "
-                "per-folder start_from_now - khong quet toan "
-                "cay khi khoi dong.",
+                "mode=%s). Existing files are ignored by "
+                "per-folder first-scan baseline - khong quet "
+                "toan cay khi khoi dong.",
                 mode,
             )
 
             return
 
-        all_files = []
-
-        for path in self.iter_image_files():
-            if detect_image_format(path) is not None:
-                all_files.append(str(path))
-
-        if mode == "start_from_now":
-            self.database.bootstrap_files(all_files)
-
-            LOGGER.warning(
-                "Bootstrap completed. Existing files=%s were ignored. "
-                "Both L/R streams will be auto-reset on startup.",
-                len(all_files),
-            )
-
-        else:
+        if mode != "start_from_now":
             LOGGER.warning(
                 "Unsupported bootstrap mode=%s. "
                 "Use start_from_now for safe industrial startup.",
                 mode,
             )
-            self.database.bootstrap_files(all_files)
 
-        self.database.set_meta(
-            "bootstrap_initialized",
-            "true"
+        all_files = []
+
+        for path in self.iter_image_files():
+            all_files.append(str(path))
+
+        self.database.bootstrap_files(all_files)
+
+        LOGGER.warning(
+            "Bootstrap completed. Existing files=%s were ignored. "
+            "Both L/R streams will be auto-reset on startup.",
+            len(all_files),
         )
 
     def auto_reset_streams(self) -> None:

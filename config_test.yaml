@@ -23,11 +23,15 @@ storage:
   image_retention_days: 0
 
 model:
-  weights: "./models/AOLv2.pt"
+  classifiers:
+    BODY:
+      weights: "./models/AOL-Body.pt"
+    END:
+      weights: "./models/AOL-End.pt"
+    HEAD:
+      weights: "./models/AOL-Head.pt"
   device: cpu
-  imgsz: 1280
-  min_predict_confidence: 0.4
-  iou_threshold: 0.45
+  classifier_imgsz: 224
 
 image:
   expected_width: 1600

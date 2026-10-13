@@ -1,2 +1,4 @@
-inspection_step,roi_id,model_name,class_id,class_name,compare_x_min,compare_y_min,compare_x_max,compare_y_max,confidence,check_mode,min_count,max_count
-STEP_1,roi_001,AOLv2,0,Loi khong dung dich,368,435,1217,760,0.21,count,1,10
+inspection_step,roi_id,part_name,model_name,model_path,expected_class,compare_x_min,compare_y_min,compare_x_max,compare_y_max,confidence
+STEP_1,roi_body,BODY,AOL-Body,./models/AOL-Body.pt,Body NG,0,0,1600,1200,0.00
+STEP_1,roi_end,END,AOL-End,./models/AOL-End.pt,End OK,0,0,1600,1200,0.00
+STEP_1,roi_head,HEAD,AOL-Head,./models/AOL-Head.pt,Head OK,0,0,1600,1200,0.00
