@@ -1041,6 +1041,37 @@ class InspectionDatabase:
             finally:
                 conn.close()
 
+    def get_latest_processed_by_side(self) -> dict[str, Optional[dict]]:
+        """Lay anh DONE moi nhat cua tung side, bo qua cycle da SKIP."""
+        with self.lock:
+            conn = self.connect()
+
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT images.*
+                    FROM images
+                    LEFT JOIN cycles ON cycles.cycle_id = images.cycle_id
+                    WHERE images.image_status = 'DONE'
+                    AND images.annotated_path IS NOT NULL
+                    AND COALESCE(cycles.final_result, '') != 'SKIP'
+                    ORDER BY images.processed_at DESC
+                    """,
+                ).fetchall()
+
+                images: dict[str, Optional[dict]] = {"L": None, "R": None}
+                for row in rows:
+                    side = row["camera_side"]
+                    if side in images and images[side] is None:
+                        images[side] = dict(row)
+                    if all(images.values()):
+                        break
+
+                return images
+
+            finally:
+                conn.close()
+
     def abort_cycle(
         self,
         cycle_id: str,
@@ -2431,19 +2462,25 @@ def live_detection():
     if service is None:
         raise HTTPException(status_code=503, detail="Service not started")
 
-    image = service.database.get_latest_processed()
+    images = service.database.get_latest_processed_by_side()
 
-    if image is None:
-        return {"image": None}
-
-    if image["result_json"]:
-        try:
-            image["result"] = json.loads(image["result_json"])
-        except Exception:
-            image["result"] = None
+    for image in images.values():
+        if image is None:
+            continue
+        if image["result_json"]:
+            try:
+                image["result"] = json.loads(image["result_json"])
+            except Exception:
+                image["result"] = None
         del image["result_json"]
 
-    return {"image": image}
+    # Giu truong image cu de client dang dung API cu van hoat dong.
+    latest_image = max(
+        (image for image in images.values() if image is not None),
+        key=lambda image: image.get("processed_at") or "",
+        default=None,
+    )
+    return {"images": images, "image": latest_image}
 
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

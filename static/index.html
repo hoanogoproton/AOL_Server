@@ -52,6 +52,12 @@
             <div class="sidebar-header">
                 <h2>Cycles</h2>
                 <span class="badge" id="cycleCount">0</span>
+                <button class="sidebar-toggle" id="sidebarToggle" type="button"
+                        onclick="toggleSidebar()" aria-controls="sidebar" aria-expanded="true"
+                        title="An thanh cycle">
+                    <span aria-hidden="true">‹</span>
+                    <span class="sidebar-toggle-text">An</span>
+                </button>
             </div>
             <div class="sidebar-search">
                 <input type="text" id="cycleSearch" placeholder="Search cycle ID..." oninput="filterCycles()">
@@ -62,58 +68,65 @@
         </aside>
 
         <main class="main-content" id="mainContent">
-            <section class="live-panel" id="livePanel">
-                <div class="live-header">
-                    <div class="live-title">
-                        <span class="live-pulse" id="livePulse"></span>
-                        <h2>LIVE Detection</h2>
-                        <span class="live-sub" id="liveSub">Waiting...</span>
-                    </div>
-                    <div class="live-result" id="liveResult">
-                        <span class="live-result-label">Result</span>
-                        <span class="live-result-value" id="liveResultValue">--</span>
-                    </div>
-                </div>
-                <div class="live-body">
-                    <div class="live-preview">
-                        <img id="liveImage" src="" alt="Latest detection">
-                        <div class="live-placeholder" id="livePlaceholder">
-                            <svg width="56" height="56" viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.5">
-                                <rect x="8" y="12" width="48" height="40" rx="4"/>
-                                <circle cx="32" cy="32" r="10"/>
-                                <circle cx="32" cy="32" r="4"/>
-                                <line x1="32" y1="12" x2="32" y2="22"/>
-                                <line x1="32" y1="42" x2="32" y2="52"/>
-                            </svg>
-                            <p>Chưa có phát hiện nào</p>
-                            <span>Waiting for the latest inspection result...</span>
+            <div class="live-panels" aria-label="Liveview L va R">
+                <section class="live-panel" id="livePanelL" data-side="L">
+                    <div class="live-header">
+                        <div class="live-title">
+                            <span class="live-pulse idle" id="livePulseL"></span>
+                            <h2>LIVE L</h2>
+                            <span class="live-sub" id="liveSubL">Dang cho...</span>
                         </div>
-                        <div class="live-ov" id="liveOverlay" style="display:none">
-                            <span class="ov-chip" id="ovCycle">-</span>
-                            <span class="ov-chip" id="ovStep">-</span>
-                            <span class="ov-chip ov-side" id="ovSide">-</span>
+                        <div class="live-result pending" id="liveResultL">
+                            <span class="live-result-label">Ket qua</span>
+                            <span class="live-result-value" id="liveResultValueL">--</span>
                         </div>
                     </div>
-                    <div class="live-info" id="liveInfo">
-                        <div class="info-section">
-                            <h3>Detections</h3>
-                            <div id="liveDetections" class="live-detections">
-                                <div class="info-empty">No detections</div>
+                    <div class="live-body">
+                        <div class="live-preview">
+                            <img id="liveImageL" src="" alt="Anh kiem tra moi nhat ben L">
+                            <div class="live-placeholder" id="livePlaceholderL">
+                                <p>Ben L dang cho anh</p>
+                                <span>Chua co ket qua kiem tra hop le</span>
+                            </div>
+                            <div class="live-ov" id="liveOverlayL" style="display:none">
+                                <span class="ov-chip" id="ovCycleL">-</span>
+                                <span class="ov-chip" id="ovStepL">-</span>
+                                <span class="ov-chip ov-side">Side L</span>
                             </div>
                         </div>
-                        <div class="info-section">
-                            <h3>ROI Evaluation</h3>
-                            <div id="liveRois" class="roi-list">
-                                <div class="info-empty">No ROI data</div>
-                            </div>
+                        <div class="live-info" id="liveInfoL"></div>
+                    </div>
+                </section>
+
+                <section class="live-panel" id="livePanelR" data-side="R">
+                    <div class="live-header">
+                        <div class="live-title">
+                            <span class="live-pulse idle" id="livePulseR"></span>
+                            <h2>LIVE R</h2>
+                            <span class="live-sub" id="liveSubR">Dang cho...</span>
                         </div>
-                        <div class="info-section">
-                            <h3>Error</h3>
-                            <div id="liveError" class="info-empty">NONE</div>
+                        <div class="live-result pending" id="liveResultR">
+                            <span class="live-result-label">Ket qua</span>
+                            <span class="live-result-value" id="liveResultValueR">--</span>
                         </div>
                     </div>
-                </div>
-            </section>
+                    <div class="live-body">
+                        <div class="live-preview">
+                            <img id="liveImageR" src="" alt="Anh kiem tra moi nhat ben R">
+                            <div class="live-placeholder" id="livePlaceholderR">
+                                <p>Ben R dang cho anh</p>
+                                <span>Chua co ket qua kiem tra hop le</span>
+                            </div>
+                            <div class="live-ov" id="liveOverlayR" style="display:none">
+                                <span class="ov-chip" id="ovCycleR">-</span>
+                                <span class="ov-chip" id="ovStepR">-</span>
+                                <span class="ov-chip ov-side">Side R</span>
+                            </div>
+                        </div>
+                        <div class="live-info" id="liveInfoR"></div>
+                    </div>
+                </section>
+            </div>
 
             <div class="detail-view-wrap">
                 <div class="empty-state centered" id="emptyState">

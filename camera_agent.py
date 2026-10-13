@@ -1306,7 +1306,7 @@ class _DirState:
     scanned: bool = False
     entry_count: int = 0
 
-    # file path - tuple (mtime_ns, size) tai lan quet gan nhat
+    # file path - tuple (mtime_ns, size, content_hash) tai lan quet gan nhat
     files: dict = field(default_factory=dict)
 
 
@@ -1678,9 +1678,13 @@ class SmartSharePoller:
 
         current_files: dict = {}
         emitted = 0
+        is_cheap_dir = len(files) + len(subdirs) <= CHEAP_DIR_MAX_ENTRIES
 
         for fpath, mtime_ns, size in files:
-            current_files[fpath] = (mtime_ns, size)
+            content_hash = (
+                self._file_content_hash(fpath) if is_cheap_dir else None
+            )
+            current_files[fpath] = (mtime_ns, size, content_hash)
 
             # Baseline lan dau: ghi nhan toan bo file hien co, khong
             # emit gi - bat ke mtime (du lieu cu tren share khong bi
@@ -1688,7 +1692,7 @@ class SmartSharePoller:
             if not was_scanned:
                 continue
 
-            if info.files.get(fpath) == (mtime_ns, size):
+            if info.files.get(fpath) == (mtime_ns, size, content_hash):
                 continue
 
             self.on_candidate(Path(fpath))
@@ -1719,6 +1723,20 @@ class SmartSharePoller:
                 self._prune_subtree(known)
 
         return emitted
+
+    @staticmethod
+    def _file_content_hash(path: str) -> Optional[str]:
+        """Tra ve SHA-256 cua file trong folder nho de bat ghi de tai cho."""
+        digest = hashlib.sha256()
+
+        try:
+            with open(path, "rb") as file_obj:
+                for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            return None
+
+        return digest.hexdigest()
 
     def _prune_subtree(self, path):
         prefix = path.rstrip("\\/") + os.sep

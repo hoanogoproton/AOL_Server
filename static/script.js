@@ -2,7 +2,7 @@ let cyclesData = [];
 let selectedCycleId = null;
 let refreshInterval = null;
 let clientUrl = '';
-let liveEventId = null;
+const liveEventIds = { L: null, R: null };
 let liveImageTimer = null;
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -43,33 +43,31 @@ async function checkHealth() {
 async function pollLive() {
     try {
         const data = await fetchJSON('/api/v1/live');
-        renderLive(data.image);
+        renderLive('L', data.images?.L || null);
+        renderLive('R', data.images?.R || null);
     } catch {
-        const pulse = document.getElementById('livePulse');
-        const sub = document.getElementById('liveSub');
-        pulse.className = 'live-pulse idle';
-        sub.textContent = 'Server offline';
-        setLiveResult('pending', '--');
+        renderLive('L', null, 'Server offline');
+        renderLive('R', null, 'Server offline');
     }
 }
 
-function renderLive(image) {
-    const pulse = document.getElementById('livePulse');
-    const sub = document.getElementById('liveSub');
-    const placeholder = document.getElementById('livePlaceholder');
-    const imgEl = document.getElementById('liveImage');
-    const overlay = document.getElementById('liveOverlay');
-    const livePanel = document.getElementById('livePanel');
+function renderLive(side, image, emptyText = 'Dang cho...') {
+    const pulse = document.getElementById(`livePulse${side}`);
+    const sub = document.getElementById(`liveSub${side}`);
+    const placeholder = document.getElementById(`livePlaceholder${side}`);
+    const imgEl = document.getElementById(`liveImage${side}`);
+    const overlay = document.getElementById(`liveOverlay${side}`);
+    const livePanel = document.getElementById(`livePanel${side}`);
 
     if (!image) {
         pulse.className = 'live-pulse idle';
-        sub.textContent = 'Waiting...';
+        sub.textContent = emptyText;
         imgEl.style.display = 'none';
         placeholder.style.display = 'flex';
         overlay.style.display = 'none';
-        setLiveResult('pending', '--');
-        document.getElementById('liveInfo').innerHTML = '';
-        liveEventId = null;
+        setLiveResult(side, 'pending', '--');
+        document.getElementById(`liveInfo${side}`).innerHTML = '';
+        liveEventIds[side] = null;
         return;
     }
 
@@ -77,8 +75,8 @@ function renderLive(image) {
     overlay.style.display = 'flex';
     pulse.className = 'live-pulse';
 
-    const isNew = image.event_id !== liveEventId;
-    liveEventId = image.event_id;
+    const isNew = image.event_id !== liveEventIds[side];
+    liveEventIds[side] = image.event_id;
 
     if (isNew) {
         const src = `/api/v1/images/${image.event_id}/annotated?t=${Date.now()}`;
@@ -100,32 +98,31 @@ function renderLive(image) {
     const step = image.step || 0;
     const passed = result?.evaluation?.passed;
 
-    document.getElementById('ovCycle').textContent = `Cycle ${image.cycle_id}`;
-    document.getElementById('ovStep').textContent = `Step ${step}`;
-    document.getElementById('ovSide').textContent = `Side ${image.camera_side || '-'}`;
+    document.getElementById(`ovCycle${side}`).textContent = `Cycle ${image.cycle_id}`;
+    document.getElementById(`ovStep${side}`).textContent = `Step ${step}`;
 
     const stepLabel = step === 1 ? 'PASS' : 'OK';
     if (image.image_status === 'ERROR') {
-        setLiveResult('ng', 'ERR');
+        setLiveResult(side, 'ng', 'ERR');
     } else if (passed === true) {
-        setLiveResult('ok', stepLabel);
+        setLiveResult(side, 'ok', stepLabel);
     } else if (passed === false) {
-        setLiveResult('ng', step === 1 ? 'FAIL' : 'NG');
+        setLiveResult(side, 'ng', step === 1 ? 'FAIL' : 'NG');
     } else {
-        setLiveResult('pending', '--');
+        setLiveResult(side, 'pending', '--');
     }
 
-    renderLiveInfo(image, result);
+    renderLiveInfo(side, image, result);
 }
 
-function setLiveResult(cls, text) {
-    const chip = document.getElementById('liveResult');
+function setLiveResult(side, cls, text) {
+    const chip = document.getElementById(`liveResult${side}`);
     chip.className = `live-result ${cls}`;
-    document.getElementById('liveResultValue').textContent = text;
+    document.getElementById(`liveResultValue${side}`).textContent = text;
 }
 
-function renderLiveInfo(image, result) {
-    const info = document.getElementById('liveInfo');
+function renderLiveInfo(side, image, result) {
+    const info = document.getElementById(`liveInfo${side}`);
     const detections = result?.detections || [];
     const classifiers = result?.classifiers || [];
     const evaluation = result?.evaluation || null;
@@ -191,6 +188,17 @@ function filterCycles() {
         ? cyclesData.filter(c => c.cycle_id.toLowerCase().includes(query))
         : cyclesData;
     renderCycleList(filtered);
+}
+
+function toggleSidebar() {
+    const sidebar = document.getElementById('sidebar');
+    const button = document.getElementById('sidebarToggle');
+    const collapsed = sidebar.classList.toggle('collapsed');
+
+    button.setAttribute('aria-expanded', String(!collapsed));
+    button.title = collapsed ? 'Mo thanh cycle' : 'An thanh cycle';
+    button.querySelector('.sidebar-toggle-text').textContent = collapsed ? 'Mo' : 'An';
+    button.querySelector('[aria-hidden="true"]').textContent = collapsed ? '›' : '‹';
 }
 
 function renderCycleList(cycles) {
