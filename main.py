@@ -1586,13 +1586,18 @@ class InspectionService:
             roi = roi_result["roi"]
 
             color = (0, 200, 0) if roi_result["passed"] else (0, 0, 255)
+            bounding_box_color = (
+                (255, 255, 255)
+                if event["step"] == 1 and roi_result["passed"]
+                else color
+            )
 
             x1 = int(roi["x_min"])
             y1 = int(roi["y_min"])
             x2 = int(roi["x_max"])
             y2 = int(roi["y_max"])
 
-            cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
+            cv2.rectangle(image, (x1, y1), (x2, y2), bounding_box_color, 2)
 
             part_name = str(roi_result.get("part_name", "")).strip()
             class_name = str(roi_result.get("class_name", "")).strip()
@@ -1928,15 +1933,10 @@ class InspectionService:
             else:
                 step_status = "OK" if evaluation["passed"] else "NG"
 
-            self.database.update_image_result(
-                event_id=event_id,
-                image_status="DONE",
-                result_json=result_payload,
-                annotated_path=annotated_path,
-                error_code=error_code,
-            )
-
             if step == 1 and step_status == "FAIL":
+                # Danh dau cycle SKIP truoc khi anh thanh DONE. Neu khong,
+                # liveview co the doc trung khoang anh FAIL da DONE nhung
+                # cycle chua kip SKIP.
                 self.database.set_cycle_step_result(
                     cycle_id=event["cycle_id"],
                     step=1,
@@ -1947,6 +1947,13 @@ class InspectionService:
                     cycle_id=event["cycle_id"],
                     error_code=error_code,
                 )
+                self.database.update_image_result(
+                    event_id=event_id,
+                    image_status="DONE",
+                    result_json=result_payload,
+                    annotated_path=annotated_path,
+                    error_code=error_code,
+                )
                 self.notify_client_step1_result(event, step_status, error_code)
                 LOGGER.info(
                     "Step 1 FAIL, cycle SKIP cycle=%s error=%s",
@@ -1954,6 +1961,13 @@ class InspectionService:
                     error_code,
                 )
             else:
+                self.database.update_image_result(
+                    event_id=event_id,
+                    image_status="DONE",
+                    result_json=result_payload,
+                    annotated_path=annotated_path,
+                    error_code=error_code,
+                )
                 self.database.set_cycle_step_result(
                     cycle_id=event["cycle_id"],
                     step=step,
