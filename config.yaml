@@ -70,12 +70,14 @@ sequence:
   server_cycle_timeout_sec: 1900
 
 serial:
-  # Don gian: Step 3 NG -> gui ky tu '0' qua COM. Khong ACK, khong CRC.
-  enabled: false
-  port: "COM3"
-  baudrate: 115200
-  retry_count: 3           # so lan gui lai khi port COM loi
-  retry_interval_sec: 0.2  # nghi giua cac lan retry (giay)
+  enabled: true
+  port: "COM9"
+  baudrate: 9600
+  retry_count: 3
+  retry_interval_sec: 0.2
+
+  ng_signal_duration_sec: 2.0
+  ng_signal_interval_sec: 0.1
 
 # ============================================================
 # MERGED MODE: webhook Step 1 FAIL gửi về Camera Agent

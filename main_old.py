@@ -1,0 +1,2514 @@
+import shutil
+import csv
+import hashlib
+import json
+import logging
+import os
+import queue
+import re
+import requests
+import sqlite3
+import threading
+import time
+import traceback
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from pathlib import Path
+from typing import Literal, Optional
+
+import cv2
+import serial
+import yaml
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field, field_validator
+from ultralytics import YOLO
+
+# MERGED MODE: Camera Agent chạy chung process với AI Server.
+import camera_agent as camera_agent_module
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+CONFIG_PATH = os.environ.get("AI_CONFIG", "config.yaml")
+
+
+def load_config(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+CONFIG = load_config(CONFIG_PATH)
+
+
+def setup_logging() -> logging.Logger:
+    log_dir = Path(CONFIG["storage"]["base_dir"]) / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    logger = logging.getLogger("AIInspection")
+    logger.setLevel(logging.INFO)
+
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(threadName)s | %(message)s"
+    )
+
+    file_handler = logging.FileHandler(
+        log_dir / "inspection_server.log",
+        encoding="utf-8"
+    )
+    file_handler.setFormatter(formatter)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+
+    if not logger.handlers:
+        logger.addHandler(file_handler)
+        logger.addHandler(console_handler)
+
+    return logger
+
+
+LOGGER = setup_logging()
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+SAFE_COMPONENT_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def safe_component(value: str, field_name: str) -> str:
+    if not value or not SAFE_COMPONENT_PATTERN.match(value):
+        raise ValueError(
+            f"{field_name} chỉ được chứa A-Z, a-z, 0-9, _, -, ."
+        )
+    return value
+
+
+def utc_now_iso() -> str:
+    return datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+
+
+def sanitize_filename(value: Optional[str]) -> Optional[str]:
+    """
+    Làm sạch tên file gốc do camera agent gửi kèm multipart:
+    - Bỏ thành phần thư mục (chống path traversal).
+    - Thay ký tự ngoài A-Za-z0-9 _ . - ( ) [ ] và khoảng trắng bằng '_'.
+    - Giới hạn 200 ký tự.
+    Trả về None nếu tên rỗng/không hợp lệ.
+    """
+    if not value:
+        return None
+
+    name = Path(value).name.strip()
+
+    if not name or name in {".", ".."}:
+        return None
+
+    name = re.sub(r"[^A-Za-z0-9_.\-\(\)\[\] ]", "_", name).strip(" .")
+
+    return name[:200] or None
+
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+
+    return h.hexdigest()
+
+
+def detect_image_suffix(header: bytes) -> str:
+    if header.startswith(b"\xFF\xD8\xFF"):
+        return ".jpg"
+
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+
+    if header.startswith(b"BM"):
+        return ".bmp"
+
+    raise ValueError("Unsupported or invalid image format")
+
+
+# ============================================================
+# DATA MODELS
+# ============================================================
+
+class ImageMetadata(BaseModel):
+    event_id: str = Field(..., description="Mã duy nhất cho một ảnh")
+    cycle_id: str = Field(..., description="Mã cycle chung Step 1 và Step 3")
+    camera_side: Literal["L", "R"]
+    tube_type: str
+    step: Literal[1, 3]
+    observed_at: str
+
+    @field_validator("event_id", "cycle_id", "tube_type")
+    @classmethod
+    def validate_safe_component(cls, value: str) -> str:
+        return safe_component(value, "metadata value")
+
+
+class AbortCycleRequest(BaseModel):
+    cycle_id: str
+    camera_side: Literal["L", "R"]
+    tube_type: str
+    error_code: str
+
+    @field_validator("cycle_id", "tube_type", "error_code")
+    @classmethod
+    def validate_safe_component(cls, value: str) -> str:
+        return safe_component(value, "abort value")
+
+
+@dataclass
+class RoiRule:
+    inspection_step: str
+    roi_id: str
+    model_name: str
+    class_id: int
+    class_name: str
+    x_min: float
+    y_min: float
+    x_max: float
+    y_max: float
+    confidence: float
+    check_mode: str
+    min_count: int
+    max_count: int
+
+
+@dataclass
+class Detection:
+    class_id: int
+    confidence: float
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+
+    @property
+    def center_x(self) -> float:
+        return (self.x1 + self.x2) / 2.0
+
+    @property
+    def center_y(self) -> float:
+        return (self.y1 + self.y2) / 2.0
+
+
+@dataclass
+class ClassifierResult:
+    part_name: str
+    model_name: str
+    predicted_class: str
+    class_id: int
+    confidence: float
+    roi: dict
+
+
+# ============================================================
+# ROI RULE ENGINE
+# ============================================================
+
+class RoiRuleEngine:
+    def __init__(self, csv_path: str):
+        self.rules: list[RoiRule] = []
+        self.classifier_rules: list[dict] = []
+        self.is_classifier_rules = False
+        self.load_rules(csv_path)
+
+    @staticmethod
+    def normalize_model_name(model_name: str) -> str:
+        normalized = (model_name or "").strip().lower()
+        aliases = {
+            "aol": "best1",
+            "best1": "best1",
+            "aol_model": "best1",
+        }
+        return aliases.get(normalized, normalized)
+
+    def load_rules(self, csv_path: str) -> None:
+        self.rules.clear()
+        self.classifier_rules.clear()
+
+        with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+
+            if reader.fieldnames and "part_name" in reader.fieldnames:
+                self.is_classifier_rules = True
+                for row in reader:
+                    self.classifier_rules.append(
+                        {
+                            "inspection_step": row["inspection_step"].strip(),
+                            "roi_id": row["roi_id"].strip(),
+                            "part_name": row["part_name"].strip(),
+                            "model_name": row["model_name"].strip(),
+                            "model_path": row.get("model_path", "").strip(),
+                            "expected_class": row["expected_class"].strip(),
+                            "x_min": float(row["compare_x_min"]),
+                            "y_min": float(row["compare_y_min"]),
+                            "x_max": float(row["compare_x_max"]),
+                            "y_max": float(row["compare_y_max"]),
+                            "confidence": float(row["confidence"]),
+                        }
+                    )
+                LOGGER.info(
+                    "Loaded %s classifier ROI rules from %s",
+                    len(self.classifier_rules),
+                    csv_path,
+                )
+                return
+
+            for row in reader:
+                self.rules.append(
+                    RoiRule(
+                        inspection_step=row["inspection_step"].strip(),
+                        roi_id=row["roi_id"].strip(),
+                        model_name=row["model_name"].strip(),
+                        class_id=int(row["class_id"]),
+                        class_name=row["class_name"].strip(),
+                        x_min=float(row["compare_x_min"]),
+                        y_min=float(row["compare_y_min"]),
+                        x_max=float(row["compare_x_max"]),
+                        y_max=float(row["compare_y_max"]),
+                        confidence=float(row["confidence"]),
+                        check_mode=row["check_mode"].strip(),
+                        min_count=int(row["min_count"]),
+                        max_count=int(row["max_count"]),
+                    )
+                )
+
+        LOGGER.info("Loaded %s ROI rules from %s", len(self.rules), csv_path)
+
+    def get_classifier_rules(self, inspection_step: str) -> list[dict]:
+        return [
+            rule
+            for rule in self.classifier_rules
+            if rule["inspection_step"] == inspection_step
+        ]
+
+    def evaluate_classifiers(
+        self,
+        inspection_step: str,
+        results: list[ClassifierResult],
+    ) -> dict:
+        rules = self.get_classifier_rules(inspection_step)
+        if not rules:
+            raise RuntimeError(
+                f"Không tìm thấy classifier ROI rule cho step={inspection_step}"
+            )
+
+        result_by_part = {item.part_name: item for item in results}
+        roi_results = []
+        all_passed = True
+
+        for rule in rules:
+            prediction = result_by_part.get(rule["part_name"])
+            expected = rule["expected_class"]
+            passed = bool(
+                prediction
+                and self.class_names_match(prediction.predicted_class, expected)
+                and prediction.confidence >= rule["confidence"]
+            )
+            all_passed = all_passed and passed
+
+            roi_results.append(
+                {
+                    "roi_id": rule["roi_id"],
+                    "part_name": rule["part_name"],
+                    "class_name": prediction.predicted_class if prediction else "",
+                    "expected_class": expected,
+                    "confidence": prediction.confidence if prediction else 0.0,
+                    "confidence_threshold": rule["confidence"],
+                    "passed": passed,
+                    "roi": {
+                        "x_min": rule["x_min"],
+                        "y_min": rule["y_min"],
+                        "x_max": rule["x_max"],
+                        "y_max": rule["y_max"],
+                    },
+                }
+            )
+
+        return {
+            "inspection_step": inspection_step,
+            "model_name": "classifier_bundle",
+            "passed": all_passed,
+            "roi_results": roi_results,
+        }
+
+    @staticmethod
+    def class_names_match(actual: str, expected: str) -> bool:
+        def normalize(value: str) -> str:
+            return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+        actual_normalized = normalize(actual)
+        expected_normalized = normalize(expected)
+        if actual_normalized == expected_normalized:
+            return True
+
+        # Cho phep model tra ve "OK" trong khi rule ghi "Body OK".
+        return actual_normalized in {"ok", "ng"} and actual_normalized in expected_normalized
+
+    def get_rules(self, inspection_step: str, model_name: str) -> list[RoiRule]:
+        target_name = self.normalize_model_name(model_name)
+
+        return [
+            rule
+            for rule in self.rules
+            if rule.inspection_step == inspection_step
+            and self.normalize_model_name(rule.model_name) == target_name
+        ]
+
+    @staticmethod
+    def detection_inside_roi(det: Detection, rule: RoiRule) -> bool:
+        # Quy tắc: tâm bounding box nằm trong ROI.
+        return (
+            rule.x_min <= det.center_x <= rule.x_max
+            and rule.y_min <= det.center_y <= rule.y_max
+        )
+
+    def evaluate(
+        self,
+        inspection_step: str,
+        model_name: str,
+        detections: list[Detection],
+    ) -> dict:
+        rules = self.get_rules(inspection_step, model_name)
+
+        if not rules:
+            raise RuntimeError(
+                f"Không tìm thấy ROI rule cho step={inspection_step}, "
+                f"model={model_name}"
+            )
+
+        roi_results = []
+        all_passed = True
+
+        for rule in rules:
+            matched = []
+
+            for det in detections:
+                if det.class_id != rule.class_id:
+                    continue
+
+                if det.confidence < rule.confidence:
+                    continue
+
+                if self.detection_inside_roi(det, rule):
+                    matched.append(det)
+
+            count = len(matched)
+
+            passed = rule.min_count <= count <= rule.max_count
+            if not passed:
+                all_passed = False
+
+            roi_results.append(
+                {
+                    "roi_id": rule.roi_id,
+                    "class_id": rule.class_id,
+                    "class_name": rule.class_name,
+                    "count": count,
+                    "min_count": rule.min_count,
+                    "max_count": rule.max_count,
+                    "passed": passed,
+                    "confidence_threshold": rule.confidence,
+                    "roi": {
+                        "x_min": rule.x_min,
+                        "y_min": rule.y_min,
+                        "x_max": rule.x_max,
+                        "y_max": rule.y_max,
+                    },
+                }
+            )
+
+        return {
+            "inspection_step": inspection_step,
+            "model_name": model_name,
+            "passed": all_passed,
+            "roi_results": roi_results,
+        }
+
+
+# ============================================================
+# SQLITE DATABASE
+# ============================================================
+
+class InspectionDatabase:
+    def __init__(self, database_path: str):
+        self.database_path = database_path
+        self.lock = threading.Lock()
+
+        Path(database_path).parent.mkdir(parents=True, exist_ok=True)
+        self.initialize()
+
+    def connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(
+            self.database_path,
+            timeout=30,
+            check_same_thread=False
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        return conn
+
+    def initialize(self) -> None:
+        with self.lock:
+            conn = self.connect()
+
+            try:
+                conn.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS cycles (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        cycle_id TEXT UNIQUE NOT NULL,
+                        camera_side TEXT NOT NULL,
+                        tube_type TEXT NOT NULL,
+
+                        step1_status TEXT,
+                        step1_error TEXT,
+
+                        step3_status TEXT,
+                        step3_error TEXT,
+
+                        final_result TEXT,
+                        final_error TEXT,
+
+                        com_status TEXT NOT NULL DEFAULT 'NONE',
+                        com_updated_at TEXT,
+
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+
+                    CREATE TABLE IF NOT EXISTS images (
+                        event_id TEXT PRIMARY KEY,
+                        cycle_id TEXT NOT NULL,
+                        camera_side TEXT NOT NULL,
+                        tube_type TEXT NOT NULL,
+                        step INTEGER NOT NULL,
+                        capture_timestamp TEXT NOT NULL,
+                        original_filename TEXT,
+
+                        image_path TEXT NOT NULL,
+                        image_sha256 TEXT NOT NULL,
+                        annotated_path TEXT,
+
+                        image_status TEXT NOT NULL DEFAULT 'RECEIVED',
+                        result_json TEXT,
+                        error_code TEXT,
+
+                        received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        processed_at TEXT
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_images_cycle
+                    ON images(cycle_id);
+
+                    CREATE INDEX IF NOT EXISTS idx_images_status
+                    ON images(image_status);
+
+                    CREATE INDEX IF NOT EXISTS idx_cycles_com
+                    ON cycles(com_status);
+                    """
+                )
+                conn.commit()
+
+                # Migration nhẹ cho DB cũ: thêm cột original_filename
+                # nếu chưa tồn tại (lưu tên file ảnh gốc do camera đặt).
+                image_columns = {
+                    row["name"]
+                    for row in conn.execute(
+                        "PRAGMA table_info(images)"
+                    ).fetchall()
+                }
+
+                if "original_filename" not in image_columns:
+                    conn.execute(
+                        "ALTER TABLE images ADD COLUMN original_filename TEXT"
+                    )
+                    conn.commit()
+
+            finally:
+                conn.close()
+
+    def insert_image(
+        self,
+        metadata: ImageMetadata,
+        image_path: str,
+        image_sha256: str,
+        original_filename: Optional[str] = None,
+    ) -> bool:
+        with self.lock:
+            conn = self.connect()
+
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO cycles (
+                        cycle_id, camera_side, tube_type
+                    )
+                    VALUES (?, ?, ?)
+                    """,
+                    (
+                        metadata.cycle_id,
+                        metadata.camera_side,
+                        metadata.tube_type,
+                    ),
+                )
+
+                cursor = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO images (
+                        event_id,
+                        cycle_id,
+                        camera_side,
+                        tube_type,
+                        step,
+                        capture_timestamp,
+                        original_filename,
+                        image_path,
+                        image_sha256,
+                        image_status
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'RECEIVED')
+                    """,
+                    (
+                        metadata.event_id,
+                        metadata.cycle_id,
+                        metadata.camera_side,
+                        metadata.tube_type,
+                        metadata.step,
+
+                        metadata.observed_at,
+
+                        original_filename,
+
+                        image_path,
+                        image_sha256,
+                    ),
+                )
+
+                inserted = cursor.rowcount == 1
+                conn.commit()
+                return inserted
+
+            except Exception:
+                conn.rollback()
+                raise
+
+            finally:
+                conn.close()
+
+    def get_image(self, event_id: str) -> Optional[dict]:
+        with self.lock:
+            conn = self.connect()
+
+            try:
+                row = conn.execute(
+                    "SELECT * FROM images WHERE event_id = ?",
+                    (event_id,),
+                ).fetchone()
+
+                return dict(row) if row else None
+
+            finally:
+                conn.close()
+
+    def reset_processing_images(self) -> list[str]:
+        with self.lock:
+            conn = self.connect()
+
+            try:
+                conn.execute(
+                    """
+                    UPDATE images
+                    SET image_status = 'RECEIVED'
+                    WHERE image_status = 'PROCESSING'
+                    """
+                )
+
+                rows = conn.execute(
+                    """
+                    SELECT event_id
+                    FROM images
+                    WHERE image_status = 'RECEIVED'
+                    ORDER BY received_at ASC
+                    """
+                ).fetchall()
+
+                conn.commit()
+                return [row["event_id"] for row in rows]
+
+            finally:
+                conn.close()
+
+    def mark_image_processing(self, event_id: str) -> None:
+        with self.lock:
+            conn = self.connect()
+
+            try:
+                conn.execute(
+                    """
+                    UPDATE images
+                    SET image_status = 'PROCESSING'
+                    WHERE event_id = ?
+                    """,
+                    (event_id,),
+                )
+                conn.commit()
+
+            finally:
+                conn.close()
+
+    def update_image_result(
+        self,
+        event_id: str,
+        image_status: str,
+        result_json: dict,
+        annotated_path: Optional[str],
+        error_code: Optional[str],
+    ) -> None:
+        with self.lock:
+            conn = self.connect()
+
+            try:
+                conn.execute(
+                    """
+                    UPDATE images
+                    SET
+                        image_status = ?,
+                        result_json = ?,
+                        annotated_path = ?,
+                        error_code = ?,
+                        processed_at = CURRENT_TIMESTAMP
+                    WHERE event_id = ?
+                    """,
+                    (
+                        image_status,
+                        json.dumps(result_json, ensure_ascii=False),
+                        annotated_path,
+                        error_code,
+                        event_id,
+                    ),
+                )
+                conn.commit()
+
+            finally:
+                conn.close()
+
+    def set_cycle_step_result(
+        self,
+        cycle_id: str,
+        step: int,
+        status: str,
+        error_code: str,
+    ) -> None:
+        if step == 1:
+            status_column = "step1_status"
+            error_column = "step1_error"
+        elif step == 3:
+            status_column = "step3_status"
+            error_column = "step3_error"
+        else:
+            raise ValueError("Step chỉ được là 1 hoặc 3")
+
+        with self.lock:
+            conn = self.connect()
+
+            try:
+                conn.execute(
+                    f"""
+                    UPDATE cycles
+                    SET
+                        {status_column} = ?,
+                        {error_column} = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE cycle_id = ?
+                    """,
+                    (status, error_code, cycle_id),
+                )
+                conn.commit()
+
+            finally:
+                conn.close()
+
+    def finalize_if_ready(self, cycle_id: str) -> Optional[dict]:
+        """
+        Chỉ final sau khi đã có kết quả cả Step 1 và Step 3.
+        """
+        with self.lock:
+            conn = self.connect()
+
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+
+                row = conn.execute(
+                    """
+                    SELECT *
+                    FROM cycles
+                    WHERE cycle_id = ?
+                    """,
+                    (cycle_id,),
+                ).fetchone()
+
+                if row is None:
+                    conn.rollback()
+                    return None
+
+                if row["final_result"] is not None:
+                    conn.rollback()
+                    return None
+
+                # Step 1 FAIL → abort cycle ngay, không cần chờ Step 3
+                step1_status = row["step1_status"]
+                step3_status = row["step3_status"]
+
+                if step1_status is not None and step1_status != "PASS":
+                    # Step 1 FAIL → SKIP, khong gui COM (nhung Edge: webhook fail,
+                    # Step 3 van den sau → van ghi SKIP + ABORTED cho dong bo)
+                    final_result = "SKIP"
+                    final_error = row["step1_error"] or "E110_PRE_GLUE_FAIL"
+                    com_status = "ABORTED"
+                elif step1_status is None or step3_status is None:
+                    conn.rollback()
+                    return None
+                else:
+                    step1_pass = step1_status == "PASS"
+                    step3_pass = step3_status == "OK"
+                    if step1_pass and step3_pass:
+                        final_result = "OK"
+                        final_error = "NONE"
+                    else:
+                        final_result = "NG"
+                        if not step1_pass:
+                            final_error = row["step1_error"] or "E110_PRE_GLUE_FAIL"
+                        else:
+                            final_error = row["step3_error"] or "E300_FINAL_INSPECTION_FAIL"
+                    com_status = "PENDING"
+
+                cursor = conn.execute(
+                    """
+                    UPDATE cycles
+                    SET
+                        final_result = ?,
+                        final_error = ?,
+                        com_status = ?,
+                        com_updated_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE cycle_id = ?
+                    AND final_result IS NULL
+                    """,
+                    (
+                        final_result,
+                        final_error,
+                        com_status,
+                        cycle_id,
+                    ),
+                )
+
+                if cursor.rowcount != 1:
+                    conn.rollback()
+                    return None
+
+                updated = conn.execute(
+                    """
+                    SELECT *
+                    FROM cycles
+                    WHERE cycle_id = ?
+                    """,
+                    (cycle_id,),
+                ).fetchone()
+
+                conn.commit()
+                return dict(updated)
+
+            except Exception:
+                conn.rollback()
+                raise
+
+            finally:
+                conn.close()
+
+    def delete_cycle(self, cycle_id: str) -> None:
+        """
+        Xóa luôn cycle khi Step 1 FAIL để ảnh tiếp theo là cycle mới.
+        """
+        with self.lock:
+            conn = self.connect()
+
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+
+                conn.execute(
+                    """
+                    DELETE FROM cycles
+                    WHERE cycle_id = ?
+                    """,
+                    (cycle_id,),
+                )
+
+                conn.commit()
+
+            except Exception:
+                conn.rollback()
+                raise
+
+            finally:
+                conn.close()
+
+    def timeout_cycles(self, timeout_seconds: int) -> list[dict]:
+        """
+        Nếu đã nhận Step 1 nhưng quá lâu không có Step 3,
+        hoặc nhận Step 3 mà thiếu Step 1, final sẽ là NG.
+        """
+        timeout_payloads = []
+
+        with self.lock:
+            conn = self.connect()
+
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM cycles
+                    WHERE final_result IS NULL
+                    AND (
+                        julianday('now') - julianday(created_at)
+                    ) * 86400 >= ?
+                    """,
+                    (timeout_seconds,),
+                ).fetchall()
+
+                for row in rows:
+                    if row["step1_status"] is None:
+                        error_code = "E203_STEP1_MISSING"
+                    elif row["step3_status"] is None:
+                        error_code = "E204_STEP3_MISSING"
+                    else:
+                        continue
+
+                    conn.execute(
+                        """
+                        UPDATE cycles
+                        SET
+                            final_result = 'NG',
+                            final_error = ?,
+                            com_status = 'PENDING',
+                            com_updated_at = CURRENT_TIMESTAMP,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE cycle_id = ?
+                        AND final_result IS NULL
+                        """,
+                        (error_code, row["cycle_id"]),
+                    )
+
+                    updated = conn.execute(
+                        """
+                        SELECT *
+                        FROM cycles
+                        WHERE cycle_id = ?
+                        """,
+                        (row["cycle_id"],),
+                    ).fetchone()
+
+                    timeout_payloads.append(dict(updated))
+
+                conn.commit()
+                return timeout_payloads
+
+            except Exception:
+                conn.rollback()
+                raise
+
+            finally:
+                conn.close()
+
+    def get_cycle(self, cycle_id: str) -> Optional[dict]:
+        with self.lock:
+            conn = self.connect()
+
+            try:
+                row = conn.execute(
+                    """
+                    SELECT *
+                    FROM cycles
+                    WHERE cycle_id = ?
+                    """,
+                    (cycle_id,),
+                ).fetchone()
+
+                return dict(row) if row else None
+
+            finally:
+                conn.close()
+
+    def list_cycles(self, limit: int = 50, offset: int = 0) -> list[dict]:
+        with self.lock:
+            conn = self.connect()
+
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM cycles
+                    ORDER BY id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (limit, offset),
+                ).fetchall()
+
+                return [dict(row) for row in rows]
+
+            finally:
+                conn.close()
+
+    def get_images_for_cycle(self, cycle_id: str) -> list[dict]:
+        with self.lock:
+            conn = self.connect()
+
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM images
+                    WHERE cycle_id = ?
+                    ORDER BY step ASC, received_at ASC
+                    """,
+                    (cycle_id,),
+                ).fetchall()
+
+                return [dict(row) for row in rows]
+
+            finally:
+                conn.close()
+
+    def get_recent_images(self, limit: int = 20) -> list[dict]:
+        with self.lock:
+            conn = self.connect()
+
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM images
+                    ORDER BY received_at DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+
+                return [dict(row) for row in rows]
+
+            finally:
+                conn.close()
+
+    def get_latest_processed(self) -> Optional[dict]:
+        with self.lock:
+            conn = self.connect()
+
+            try:
+                row = conn.execute(
+                    """
+                    SELECT *
+                    FROM images
+                    WHERE image_status = 'DONE'
+                    AND annotated_path IS NOT NULL
+                    ORDER BY processed_at DESC
+                    LIMIT 1
+                    """,
+                ).fetchone()
+
+                return dict(row) if row else None
+
+            finally:
+                conn.close()
+
+    def get_latest_processed_by_side(self) -> dict[str, Optional[dict]]:
+        """Lay anh DONE moi nhat cua tung side, bo qua cycle da SKIP."""
+        with self.lock:
+            conn = self.connect()
+
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT images.*
+                    FROM images
+                    LEFT JOIN cycles ON cycles.cycle_id = images.cycle_id
+                    WHERE images.image_status = 'DONE'
+                    AND images.annotated_path IS NOT NULL
+                    AND COALESCE(cycles.final_result, '') != 'SKIP'
+                    ORDER BY images.processed_at DESC
+                    """,
+                ).fetchall()
+
+                images: dict[str, Optional[dict]] = {"L": None, "R": None}
+                for row in rows:
+                    side = row["camera_side"]
+                    if side in images and images[side] is None:
+                        images[side] = dict(row)
+                    if all(images.values()):
+                        break
+
+                return images
+
+            finally:
+                conn.close()
+
+    def abort_cycle(
+        self,
+        cycle_id: str,
+        camera_side: str,
+        tube_type: str,
+        error_code: str,
+    ) -> tuple[dict, bool]:
+        with self.lock:
+            conn = self.connect()
+
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO cycles (
+                        cycle_id,
+                        camera_side,
+                        tube_type
+                    )
+                    VALUES (?, ?, ?)
+                    """,
+                    (
+                        cycle_id,
+                        camera_side,
+                        tube_type,
+                    ),
+                )
+
+                cursor = conn.execute(
+                    """
+                    UPDATE cycles
+                    SET
+                        final_result = 'NG',
+                        final_error = ?,
+                        com_status = 'PENDING',
+                        com_updated_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE cycle_id = ?
+                    AND final_result IS NULL
+                    """,
+                    (
+                        error_code,
+                        cycle_id,
+                    ),
+                )
+
+                row = conn.execute(
+                    """
+                    SELECT *
+                    FROM cycles
+                    WHERE cycle_id = ?
+                    """,
+                    (cycle_id,),
+                ).fetchone()
+
+                conn.commit()
+
+                return dict(row), cursor.rowcount == 1
+
+            except Exception:
+                conn.rollback()
+                raise
+
+            finally:
+                conn.close()
+
+    def abort_cycle_s1_fail(self, cycle_id: str, error_code: str) -> None:
+        with self.lock:
+            conn = self.connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    """
+                    UPDATE cycles
+                    SET
+                        final_result = 'SKIP',
+                        final_error = ?,
+                        com_status = 'ABORTED',
+                        com_updated_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE cycle_id = ?
+                    AND final_result IS NULL
+                    """,
+                    (error_code, cycle_id),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+
+# ============================================================
+# SERIAL / ARDUINO SIGNAL SENDER
+# ============================================================
+
+class ArduinoSignalSender:
+    """
+    Gửi tín hiệu đơn giản qua COM tới Arduino.
+
+    Giao thức: khi Step 3 phát hiện sản phẩm lỗi (NG) thì gửi b"0\r\n".
+    Không packet, không CRC, không SEQ, không chờ ACK (fire-and-forget).
+    Chỉ retry khi cổng COM lỗi (rút cáp, port bận...) — không có vòng
+    retry ở tầng DB/monitor.
+    """
+
+    NG_SIGNAL = b"0\r\n"
+
+    def __init__(self, config: dict):
+        self.enabled = bool(config["enabled"])
+        self.port = config["port"]
+        self.baudrate = int(config["baudrate"])
+        self.retry_count = int(config.get("retry_count", 3))
+        self.retry_interval_sec = float(config.get("retry_interval_sec", 0.2))
+
+        self.serial_conn: Optional[serial.Serial] = None
+        self.lock = threading.Lock()
+
+    def is_connected(self) -> bool:
+        return bool(
+            self.serial_conn is not None
+            and self.serial_conn.is_open
+        )
+
+    def ensure_open(self) -> None:
+        if not self.enabled:
+            return
+
+        if self.serial_conn is not None and self.serial_conn.is_open:
+            return
+
+        LOGGER.info("Opening serial port %s", self.port)
+
+        self.serial_conn = serial.Serial(
+            port=self.port,
+            baudrate=self.baudrate,
+            timeout=0.1,
+            write_timeout=1,
+        )
+
+        # Mở cổng kéo DTR lên -> Arduino tự reset, chờ bootloader xong.
+        time.sleep(1.5)
+
+        try:
+            self.serial_conn.reset_input_buffer()
+            self.serial_conn.reset_output_buffer()
+        except Exception:
+            pass
+
+    def send_ng_signal(self) -> bool:
+        """
+        Gửi ký tự '0' báo Step 3 NG. True = đã ghi ra cổng thành công.
+        """
+        if not self.enabled:
+            LOGGER.warning("Serial disabled. Skip NG signal (simulate sent).")
+            return True
+
+        with self.lock:
+            for attempt in range(1, self.retry_count + 1):
+                try:
+                    self.ensure_open()
+
+                    assert self.serial_conn is not None
+
+                    self.serial_conn.write(self.NG_SIGNAL)
+                    self.serial_conn.flush()
+
+                    LOGGER.info(
+                        "NG signal '0' sent to %s attempt=%s",
+                        self.port,
+                        attempt,
+                    )
+                    return True
+
+                except Exception as ex:
+                    LOGGER.error(
+                        "Serial write failed attempt=%s: %s",
+                        attempt,
+                        ex,
+                    )
+
+                    try:
+                        if self.serial_conn is not None:
+                            self.serial_conn.close()
+                    except Exception:
+                        pass
+
+                    self.serial_conn = None
+
+                time.sleep(self.retry_interval_sec)
+
+        LOGGER.error("NG signal FAILED after retries. COM=%s", self.port)
+        return False
+
+
+# ============================================================
+# INSPECTION SERVICE
+# ============================================================
+
+class InspectionService:
+    # Chu ky chay thread don dep anh cu (30 phut / lan).
+    RETENTION_CHECK_INTERVAL_SEC = 1800
+
+    def __init__(self, config: dict):
+        self.config = config
+
+        self.raw_dir = Path(config["storage"]["raw_dir"])
+        self.annotated_dir = Path(config["storage"]["annotated_dir"])
+
+        self.raw_dir.mkdir(parents=True, exist_ok=True)
+        self.annotated_dir.mkdir(parents=True, exist_ok=True)
+
+        # ====================================================
+        # Thu muc goc luu ket qua NG (anh NG + file log STEP3).
+        # Cho phep tro vao network share (UNC path) qua config
+        # 'storage.ng_dir'; khong cau hinh -> giu hanh vi cu
+        # (<base_dir>/ng). Share khong truy cap duoc khi khoi
+        # dong -> fallback ve thu muc local, khong lam chet server.
+        # ====================================================
+        storage_cfg = config.get("storage") or {}
+
+        default_ng_dir = Path(storage_cfg["base_dir"]) / "ng"
+        configured_ng_dir = storage_cfg.get("ng_dir")
+
+        if configured_ng_dir:
+            self.ng_dir = Path(str(configured_ng_dir))
+        else:
+            self.ng_dir = default_ng_dir
+
+        try:
+            self.ng_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as ex:
+            LOGGER.error(
+                "Khong tao duoc thu muc NG '%s' (%s). "
+                "Fallback ve thu muc local '%s'.",
+                self.ng_dir,
+                ex,
+                default_ng_dir,
+            )
+            self.ng_dir = default_ng_dir
+            self.ng_dir.mkdir(parents=True, exist_ok=True)
+
+        # Log STEP3 (CSV) LUON luu o local (<base_dir>/logs); khi co
+        # 'storage.ng_dir' (share mang) thi ghi them ban sao len
+        # <ng_dir>/logs. Xem step3_log_dirs().
+        self.ng_dir_configured = bool(configured_ng_dir)
+
+        # Thoi han giu anh raw/annotated tren may local (ngay). Qua
+        # han, thread 'Image-Cleanup' se xoa anh cu di (ban sao anh
+        # NG + raw NG + log da duoc ghi len 'storage.ng_dir' tren
+        # mang truoc). Dat 0 trong config de tat don dep tu dong.
+        self.image_retention_days = int(
+            storage_cfg.get("image_retention_days", 1)
+        )
+
+        self.database = InspectionDatabase(
+            config["storage"]["database_path"]
+        )
+
+        self.rule_engine = RoiRuleEngine(
+            config["roi"]["csv_path"]
+        )
+
+        self.signal_sender = ArduinoSignalSender(
+            config["serial"]
+        )
+
+        self.classifier_models: dict[str, YOLO] = {}
+
+        self.job_queue: queue.Queue[str] = queue.Queue()
+        self.stop_event = threading.Event()
+
+        self.worker_thread: Optional[threading.Thread] = None
+        self.monitor_thread: Optional[threading.Thread] = None
+        self.cleanup_thread: Optional[threading.Thread] = None
+
+    def get_classifier_specs(self) -> dict[str, dict]:
+        model_cfg = self.config.get("model", {})
+        classifiers = model_cfg.get("classifiers") or {}
+        if not classifiers:
+            raise RuntimeError("Chưa cấu hình model.classifiers")
+        return classifiers
+
+    def start(self) -> None:
+        LOGGER.info("Loading classifier models...")
+        for part_name, model_spec in self.get_classifier_specs().items():
+            model_path = model_spec["weights"]
+            self.classifier_models[part_name] = YOLO(model_path)
+            LOGGER.info(
+                "Classifier model loaded: part=%s path=%s",
+                part_name,
+                model_path,
+            )
+
+        pending_events = self.database.reset_processing_images()
+
+        for event_id in pending_events:
+            self.job_queue.put(event_id)
+
+        self.worker_thread = threading.Thread(
+            target=self.worker_loop,
+            name="Classifier-Worker",
+            daemon=True,
+        )
+        self.worker_thread.start()
+
+        self.monitor_thread = threading.Thread(
+            target=self.monitor_loop,
+            name="Cycle-Monitor",
+            daemon=True,
+        )
+        self.monitor_thread.start()
+
+        if self.image_retention_days > 0:
+            self.cleanup_thread = threading.Thread(
+                target=self.cleanup_loop,
+                name="Image-Cleanup",
+                daemon=True,
+            )
+            self.cleanup_thread.start()
+            LOGGER.info(
+                "Image cleanup enabled: retention=%s day(s)",
+                self.image_retention_days,
+            )
+
+        LOGGER.info("Inspection service started")
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+        if self.worker_thread:
+            self.worker_thread.join(timeout=5)
+
+        if self.monitor_thread:
+            self.monitor_thread.join(timeout=5)
+
+        if self.cleanup_thread:
+            self.cleanup_thread.join(timeout=5)
+
+        LOGGER.info("Inspection service stopped")
+
+    def enqueue_event(self, event_id: str) -> None:
+        self.job_queue.put(event_id)
+
+    def worker_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                event_id = self.job_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            try:
+                self.process_event(event_id)
+            except Exception:
+                LOGGER.exception(
+                    "Unhandled worker error event=%s",
+                    event_id,
+                )
+            finally:
+                self.job_queue.task_done()
+
+    def monitor_loop(self) -> None:
+        """
+        Chỉ xử lý cycle timeout (thiếu Step 1/Step 3) -> ghi NG vào DB.
+
+        Gửi tín hiệu COM không nằm ở đây: chỉ gửi '0' ngay khi Step 3 NG
+        (xem process_event).
+        """
+        while not self.stop_event.is_set():
+            try:
+                timeout_sec = int(
+                    self.config["sequence"]["server_cycle_timeout_sec"]
+                )
+
+                for cycle in self.database.timeout_cycles(timeout_sec):
+                    LOGGER.error(
+                        "Cycle timeout: %s",
+                        cycle["cycle_id"],
+                    )
+
+            except Exception:
+                LOGGER.exception("Monitor loop error")
+
+            self.stop_event.wait(1.0)
+
+    def infer_classifiers(self, image) -> list[ClassifierResult]:
+        if not self.classifier_models:
+            raise RuntimeError("Classifier models chưa được load")
+
+        model_cfg = self.config["model"]
+        classifier_imgsz = int(model_cfg.get("classifier_imgsz", 224))
+        results: list[ClassifierResult] = []
+
+        for rule in self.rule_engine.get_classifier_rules("STEP_1"):
+            part_name = rule["part_name"]
+            if part_name not in self.classifier_models:
+                raise RuntimeError(
+                    f"Chưa load classifier cho vùng {part_name}"
+                )
+
+            # Moi part chi can infer mot lan; STEP_3 dung cung ROI.
+            if any(item.part_name == part_name for item in results):
+                continue
+
+            height, width = image.shape[:2]
+            x_min = max(0, min(width, int(rule["x_min"])))
+            y_min = max(0, min(height, int(rule["y_min"])))
+            x_max = max(x_min + 1, min(width, int(rule["x_max"])))
+            y_max = max(y_min + 1, min(height, int(rule["y_max"])))
+            crop = image[y_min:y_max, x_min:x_max]
+            if crop.size == 0:
+                raise RuntimeError(
+                    f"ROI rỗng cho vùng {part_name}: {rule['roi_id']}"
+                )
+
+            prediction = self.classifier_models[part_name].predict(
+                source=crop,
+                imgsz=classifier_imgsz,
+                device=model_cfg["device"],
+                verbose=False,
+            )[0]
+
+            if prediction.probs is None:
+                raise RuntimeError(
+                    f"Model {part_name} không trả về kết quả classification"
+                )
+
+            class_id = int(prediction.probs.top1)
+            confidence = float(prediction.probs.top1conf)
+            class_name = str(prediction.names[class_id])
+
+            results.append(
+                ClassifierResult(
+                    part_name=part_name,
+                    model_name=rule["model_name"],
+                    predicted_class=class_name,
+                    class_id=class_id,
+                    confidence=confidence,
+                    roi={
+                        "x_min": rule["x_min"],
+                        "y_min": rule["y_min"],
+                        "x_max": rule["x_max"],
+                        "y_max": rule["y_max"],
+                    },
+                )
+            )
+
+        return results
+
+    def validate_image_size(self, image) -> None:
+        image_cfg = self.config["image"]
+
+        if not bool(image_cfg["reject_wrong_resolution"]):
+            return
+
+        expected_width = int(image_cfg["expected_width"])
+        expected_height = int(image_cfg["expected_height"])
+
+        height, width = image.shape[:2]
+
+        if width != expected_width or height != expected_height:
+            raise RuntimeError(
+                f"E202_IMAGE_SIZE_INVALID: "
+                f"actual={width}x{height}, "
+                f"expected={expected_width}x{expected_height}"
+            )
+
+    def get_error_code(
+        self,
+        step: int,
+        evaluation: dict,
+    ) -> str:
+        failed_rois = [
+            item["roi_id"]
+            for item in evaluation["roi_results"]
+            if not item["passed"]
+        ]
+
+        if not failed_rois:
+            return "NONE"
+
+        if step == 1:
+            return "E110_PRE_GLUE_FAIL_" + "_".join(failed_rois)
+
+        step3_map = {
+            "roi_001": "E001_PRODUCT_OK_NOT_FOUND",
+            "roi_002": "E101_LIQUID_ERROR_ROI_002",
+            "roi_003": "E102_LIQUID_ERROR_ROI_003",
+            "roi_004": "E103_LIQUID_ERROR_ROI_004",
+        }
+
+        errors = [
+            step3_map.get(roi_id, f"E300_{roi_id}")
+            for roi_id in failed_rois
+        ]
+
+        return "|".join(errors)
+
+    def create_annotated_image(
+        self,
+        raw_image,
+        classifier_results: list[ClassifierResult],
+        evaluation: dict,
+        event: dict,
+    ) -> str:
+        image = raw_image.copy()
+
+        # Vẽ ROI.
+        for roi_result in evaluation["roi_results"]:
+            roi = roi_result["roi"]
+
+            color = (0, 200, 0) if roi_result["passed"] else (0, 0, 255)
+            bounding_box_color = (
+                (255, 255, 255)
+                if event["step"] == 1 and roi_result["passed"]
+                else color
+            )
+
+            x1 = int(roi["x_min"])
+            y1 = int(roi["y_min"])
+            x2 = int(roi["x_max"])
+            y2 = int(roi["y_max"])
+
+            cv2.rectangle(image, (x1, y1), (x2, y2), bounding_box_color, 2)
+
+            part_name = str(roi_result.get("part_name", "")).strip()
+            class_name = str(roi_result.get("class_name", "")).strip()
+            part_label = part_name.title()
+            if part_label and not class_name.lower().startswith(part_label.lower()):
+                class_label = f"{part_label} {class_name}".strip()
+            else:
+                class_label = class_name
+
+            text = (
+                f"{class_label} "
+                f"conf={roi_result.get('confidence', 0.0):.2f}"
+            )
+
+            cv2.putText(
+                image,
+                text,
+                (x1 + 4, min(image.shape[0] - 8, y1 + 22)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                color,
+                2,
+                cv2.LINE_AA,
+            )
+
+        final_text = (
+            f"Cycle={event['cycle_id']} "
+            f"Step={event['step']} "
+            f"Result={'PASS' if evaluation['passed'] else 'FAIL'}"
+        )
+
+        color = (0, 200, 0) if evaluation["passed"] else (0, 0, 255)
+
+        cv2.putText(
+            image,
+            final_text,
+            (20, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.85,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+
+        date_folder = datetime.now().strftime("%Y-%m-%d")
+        output_dir = (
+            self.annotated_dir
+            / date_folder
+            / event["camera_side"]
+            / event["tube_type"]
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        output_path = output_dir / f"{event['event_id']}_annotated.jpg"
+
+        success = cv2.imwrite(str(output_path), image)
+
+        if not success:
+            raise RuntimeError(
+                f"Không thể lưu annotated image: {output_path}"
+            )
+
+        return str(output_path)
+
+    def save_ng_screenshot(
+        self,
+        annotated_path: str,
+        event: dict,
+    ) -> Optional[str]:
+        """
+        Copy ket qua NG/FAIL (Step 1 FAIL + Step 3 NG) sang thu muc NG
+        (storage.ng_dir):
+        - Anh annotated (da ve khung + nhan): <cycle_id>/<stem>_annotated.jpg
+        - Anh raw (ban goc camera upload):    <cycle_id>/<stem>.jpg
+
+        Tra ve duong dan anh annotated (hoac None khi loi).
+        """
+        try:
+            src = Path(annotated_path)
+            if not src.exists():
+                LOGGER.warning("NG source not found: %s", annotated_path)
+                return None
+
+            cycle_dir = self.ng_dir / str(event["cycle_id"])
+            cycle_dir.mkdir(parents=True, exist_ok=True)
+
+            # Ưu tiên tên file ảnh gốc do camera đặt (vd IMG001.jpg
+            # -> IMG001_annotated.jpg); fallback về event_id nếu thiếu.
+            original_stem = Path(event.get("original_filename") or "").stem
+
+            if not original_stem:
+                original_stem = str(event["event_id"])
+
+            dst = cycle_dir / f"{original_stem}_annotated.jpg"
+            shutil.copy2(str(src), str(dst))
+            LOGGER.info("NG screenshot saved: %s", dst)
+
+            # Lưu kèm ảnh raw NG (bản gốc chưa annotate) để đối chiếu.
+            # Lỗi copy raw không làm mất kết quả copy annotated.
+            self._save_ng_raw_copy(event, cycle_dir, original_stem)
+
+            return str(dst)
+        except Exception as ex:
+            LOGGER.error("Failed to save NG screenshot: %s", ex)
+            return None
+
+    def _save_ng_raw_copy(
+        self,
+        event: dict,
+        cycle_dir: Path,
+        original_stem: str,
+    ) -> None:
+        raw_src = event.get("image_path")
+
+        if not raw_src:
+            LOGGER.warning("NG raw image skipped: no image_path")
+            return
+
+        try:
+            raw_src_path = Path(raw_src)
+
+            if not raw_src_path.exists():
+                LOGGER.warning("NG raw image not found: %s", raw_src)
+                return
+
+            # Giữ đuôi file gốc của ảnh raw (mặc định .jpg).
+            raw_dst = (
+                cycle_dir
+                / f"{original_stem}{raw_src_path.suffix or '.jpg'}"
+            )
+            shutil.copy2(str(raw_src_path), str(raw_dst))
+            LOGGER.info("NG raw image saved: %s", raw_dst)
+        except Exception as ex:
+            LOGGER.error("Failed to save NG raw image: %s", ex)
+
+    def cleanup_loop(self) -> None:
+        """
+        Thread don dep anh cu tren may local theo
+        'storage.image_retention_days' (mac dinh 1 ngay).
+        """
+        while not self.stop_event.is_set():
+            try:
+                self.cleanup_old_images()
+            except Exception:
+                LOGGER.exception("Image cleanup failed")
+
+            self.stop_event.wait(self.RETENTION_CHECK_INTERVAL_SEC)
+
+    def cleanup_old_images(self) -> None:
+        """
+        Xoa file anh (raw + annotated) cu hon 'image_retention_days'
+        ngay khoi may LOCAL, roi don cac thu muc tro nen rong.
+
+        Ban sao anh NG + raw NG + log Step 3 da duoc ghi len
+        'storage.ng_dir' (share mang) nen viec xoa local khong lam
+        mat bang chung NG. File log CSV khong bao gio bi xoa tu dong.
+        """
+        if self.image_retention_days <= 0:
+            return
+
+        cutoff = time.time() - self.image_retention_days * 86400
+        deleted = 0
+
+        for root_dir in (self.raw_dir, self.annotated_dir):
+            if not root_dir.is_dir():
+                continue
+
+            for path in root_dir.rglob("*"):
+                try:
+                    if path.is_file() and path.stat().st_mtime < cutoff:
+                        path.unlink()
+                        deleted += 1
+                except OSError as ex:
+                    LOGGER.warning("Cleanup skip %s: %s", path, ex)
+
+            self._prune_empty_dirs(root_dir)
+
+        if deleted:
+            LOGGER.info(
+                "Image cleanup removed %s file(s) older than %s day(s)",
+                deleted,
+                self.image_retention_days,
+            )
+
+    def _prune_empty_dirs(self, root_dir: Path) -> None:
+        # Don tu trong ra ngoai; khong bao gio xoa goc (root_dir).
+        # Thu muc con rong lee se duoc don o chu ky sau.
+        for dirpath, dirnames, filenames in os.walk(
+            root_dir, topdown=False
+        ):
+            current = Path(dirpath)
+
+            if current == root_dir:
+                continue
+
+            if not dirnames and not filenames:
+                try:
+                    current.rmdir()
+                except OSError:
+                    pass
+
+    def step3_log_dirs(self) -> list[Path]:
+        """
+        Danh sach thu muc ghi file log STEP3 (CSV):
+        - Local <base_dir>/logs: luon luon (ban sao tai may).
+        - <ng_dir>/logs: khi co 'storage.ng_dir' (ban sao len mang).
+        """
+        dirs = [Path(self.config["storage"]["base_dir"]) / "logs"]
+
+        if self.ng_dir_configured:
+            dirs.append(self.ng_dir / "logs")
+
+        return dirs
+
+    def log_step3_csv(self, cycle: dict, event: dict) -> None:
+        # Tên file ảnh gốc do camera đặt; fallback về tên file
+        # ảnh gốc trên server ({event_id}.jpg) nếu thiếu.
+        image_name = (
+            event.get("original_filename")
+            or Path(event.get("image_path") or "").name
+            or ""
+        )
+
+        # Ảnh NG chỉ tồn tại khi Step 3 không OK (xem save_ng_screenshot).
+        ng_image_name = ""
+        if cycle.get("step3_status") not in (None, "", "OK"):
+            ng_stem = Path(image_name).stem if image_name else event.get("event_id", "")
+            ng_image_name = f"{ng_stem}_annotated.jpg"
+
+        # Ghi log vao TAT CA cac dia (local + thu muc NG tren share).
+        # Loi ghi o mot dia khong anh huong dia con lai.
+        for log_dir in self.step3_log_dirs():
+            try:
+                log_dir.mkdir(parents=True, exist_ok=True)
+
+                csv_path = (
+                    log_dir
+                    / f"STEP3_log_{datetime.now().strftime('%Y-%m-%d')}.csv"
+                )
+
+                write_header = not csv_path.exists()
+
+                with open(csv_path, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    if write_header:
+                        writer.writerow([
+                            "datetime", "product_no", "image_name",
+                            "step3_result", "step3_error_code", "ng_image_name"
+                        ])
+                    writer.writerow([
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        cycle.get("tube_type", ""),
+                        image_name,
+                        cycle.get("step3_status", ""),
+                        cycle.get("step3_error", "NONE"),
+                        ng_image_name,
+                    ])
+            except Exception as ex:
+                LOGGER.error(
+                    "Failed to write STEP3 CSV to %s: %s", log_dir, ex
+                )
+
+    def process_event(self, event_id: str) -> None:
+        event = self.database.get_image(event_id)
+
+        if event is None:
+            LOGGER.warning("Event not found: %s", event_id)
+            return
+
+        if event["image_status"] == "DONE":
+            return
+
+        self.database.mark_image_processing(event_id)
+
+        step = int(event["step"])
+        inspection_step = "STEP_1" if step == 1 else "STEP_3"
+
+        try:
+            raw_image = cv2.imread(event["image_path"])
+
+            if raw_image is None:
+                raise RuntimeError("E202_IMAGE_READ_FAIL")
+
+            self.validate_image_size(raw_image)
+
+            classifier_results = self.infer_classifiers(raw_image)
+
+            evaluation = self.rule_engine.evaluate_classifiers(
+                inspection_step=inspection_step,
+                results=classifier_results,
+            )
+
+            error_code = self.get_error_code(
+                step,
+                evaluation,
+            )
+
+            annotated_path = self.create_annotated_image(
+                raw_image=raw_image,
+                classifier_results=classifier_results,
+                evaluation=evaluation,
+                event=event,
+            )
+
+            # Ket qua NG/FAIL (Step 1 FAIL + Step 3 NG): copy anh
+            # annotated + raw sang thu muc NG (network share). Anh OK
+            # chi ton tai tren may local theo thoi han
+            # 'storage.image_retention_days' (xem cleanup_old_images).
+            if not evaluation["passed"]:
+                self.save_ng_screenshot(annotated_path, event)
+
+                if step == 3:
+                    self.signal_sender.send_ng_signal()
+
+            result_payload = {
+                "event_id": event_id,
+                "cycle_id": event["cycle_id"],
+                "camera_side": event["camera_side"],
+                "tube_type": event["tube_type"],
+                "step": step,
+                "processed_at": utc_now_iso(),
+                "detections": [],
+                "classifiers": [
+                    asdict(result)
+                    for result in classifier_results
+                ],
+                "evaluation": evaluation,
+                "error_code": error_code,
+            }
+
+            if step == 1:
+                step_status = "PASS" if evaluation["passed"] else "FAIL"
+            else:
+                step_status = "OK" if evaluation["passed"] else "NG"
+
+            if step == 1 and step_status == "FAIL":
+                # Danh dau cycle SKIP truoc khi anh thanh DONE. Neu khong,
+                # liveview co the doc trung khoang anh FAIL da DONE nhung
+                # cycle chua kip SKIP.
+                self.database.set_cycle_step_result(
+                    cycle_id=event["cycle_id"],
+                    step=1,
+                    status="FAIL",
+                    error_code=error_code,
+                )
+                self.database.abort_cycle_s1_fail(
+                    cycle_id=event["cycle_id"],
+                    error_code=error_code,
+                )
+                self.database.update_image_result(
+                    event_id=event_id,
+                    image_status="DONE",
+                    result_json=result_payload,
+                    annotated_path=annotated_path,
+                    error_code=error_code,
+                )
+                self.notify_client_step1_result(event, step_status, error_code)
+                LOGGER.info(
+                    "Step 1 FAIL, cycle SKIP cycle=%s error=%s",
+                    event["cycle_id"],
+                    error_code,
+                )
+            else:
+                self.database.update_image_result(
+                    event_id=event_id,
+                    image_status="DONE",
+                    result_json=result_payload,
+                    annotated_path=annotated_path,
+                    error_code=error_code,
+                )
+                self.database.set_cycle_step_result(
+                    cycle_id=event["cycle_id"],
+                    step=step,
+                    status=step_status,
+                    error_code=error_code,
+                )
+
+                LOGGER.info(
+                    "Inspection done event=%s cycle=%s step=%s status=%s error=%s",
+                    event_id,
+                    event["cycle_id"],
+                    step,
+                    step_status,
+                    error_code,
+                )
+
+                final_cycle = self.database.finalize_if_ready(
+                    event["cycle_id"]
+                )
+
+                if final_cycle and step == 3:
+                    self.log_step3_csv(final_cycle, event)
+
+        except Exception as ex:
+            LOGGER.error(
+                "Inspection failed event=%s error=%s\n%s",
+                event_id,
+                ex,
+                traceback.format_exc(),
+            )
+
+            error_code = "E301_INFERENCE_OR_IMAGE_ERROR"
+
+            error_payload = {
+                "event_id": event_id,
+                "cycle_id": event["cycle_id"],
+                "step": step,
+                "error_code": error_code,
+                "detail": str(ex),
+                "processed_at": utc_now_iso(),
+            }
+
+            self.database.update_image_result(
+                event_id=event_id,
+                image_status="ERROR",
+                result_json=error_payload,
+                annotated_path=None,
+                error_code=error_code,
+            )
+
+            if step == 1:
+                step_status = "FAIL"
+                self.database.set_cycle_step_result(
+                    cycle_id=event["cycle_id"],
+                    step=1,
+                    status="FAIL",
+                    error_code=error_code,
+                )
+                self.database.abort_cycle_s1_fail(
+                    cycle_id=event["cycle_id"],
+                    error_code=error_code,
+                )
+                self.notify_client_step1_result(event, step_status, error_code)
+                LOGGER.info(
+                    "Step 1 FAIL (exception), cycle SKIP cycle=%s error=%s",
+                    event["cycle_id"],
+                    error_code,
+                )
+            else:
+                step_status = "NG"
+
+                self.database.set_cycle_step_result(
+                    cycle_id=event["cycle_id"],
+                    step=step,
+                    status=step_status,
+                    error_code=error_code,
+                )
+
+                final_cycle = self.database.finalize_if_ready(
+                    event["cycle_id"]
+                )
+
+                if final_cycle and step == 3:
+                    self.log_step3_csv(final_cycle, event)
+
+    def notify_client_step1_result(self, event: dict, step_status: str, error_code: str) -> None:
+        client_cfg = self.config["client"]
+        url = f"http://{client_cfg['host']}:{client_cfg['port']}/api/v1/inspection-result"
+        payload = {
+            "event_id": event["event_id"],
+            "cycle_id": event["cycle_id"],
+            "camera_side": event["camera_side"],
+            "tube_type": event["tube_type"],
+            "step": 1,
+            "passed": step_status == "PASS",
+            "error_code": error_code,
+        }
+        for attempt in range(1, 4):
+            try:
+                resp = requests.post(url, json=payload, timeout=3)
+                if resp.ok:
+                    LOGGER.info("Webhook S1 result sent to client cycle=%s passed=%s", event["cycle_id"], step_status == "PASS")
+                    return
+            except Exception as ex:
+                LOGGER.warning("Webhook attempt %d failed: %s", attempt, ex)
+                if attempt < 3:
+                    time.sleep(0.5)
+        LOGGER.error("Webhook S1 result FAILED after 3 retries cycle=%s", event["cycle_id"])
+
+
+# ============================================================
+# FASTAPI APPLICATION
+# ============================================================
+
+service: Optional[InspectionService] = None
+
+
+def start_camera_agent() -> None:
+    """
+    MERGED MODE: khởi động Camera Agent trong cùng process với AI Server.
+    Config lấy từ section 'camera_agent' trong config.yaml.
+
+    Agent start THẤT BẠI (mất network share, sai root_path, ...) KHÔNG
+    làm sập AI Server: web UI vẫn mở được để theo dõi, /health sẽ
+    report "camera_agent": null, nguyên nhân đầy đủ nằm trong log.
+    """
+    agent_config = CONFIG.get("camera_agent")
+
+    if not agent_config:
+        LOGGER.warning(
+            "Config khong co section 'camera_agent' -> "
+            "Camera Agent se KHONG chay (che do AI Server don le)"
+        )
+        return
+
+    camera_agent_module.CONFIG = agent_config
+    camera_agent_module.setup_logging()
+
+    try:
+        agent = camera_agent_module.CameraAgent(agent_config)
+        agent.start()
+    except Exception:
+        LOGGER.critical(
+            "Camera Agent FAILED to start -> AI Server van chay nhung "
+            "KHONG nhan du anh tu camera. Kiem tra network_share / "
+            "root_path trong 'camera_agent' config roi khoi dong lai. "
+            "Web UI: http://127.0.0.1:%s",
+            CONFIG.get("server", {}).get("port", 8080),
+            exc_info=True,
+        )
+        return
+
+    # Các route của agent (mounted ở cuối file) đọc module-global này.
+    camera_agent_module.camera_agent = agent
+
+    LOGGER.info(
+        "Camera Agent started (merged) root=%s network_share=%s",
+        agent.root_path,
+        bool(agent.network_share),
+    )
+
+
+def stop_camera_agent() -> None:
+    if camera_agent_module.camera_agent is None:
+        return
+
+    try:
+        camera_agent_module.camera_agent.stop()
+    except Exception:
+        LOGGER.exception("Camera Agent stop failed")
+    finally:
+        camera_agent_module.camera_agent = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global service
+
+    service = InspectionService(CONFIG)
+    service.start()
+
+    start_camera_agent()
+
+    yield
+
+    stop_camera_agent()
+
+    if service:
+        service.stop()
+
+
+app = FastAPI(
+    title="AOL Inspection Server",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+
+@app.get("/health")
+def health():
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not started")
+
+    camera_agent_instance = camera_agent_module.camera_agent
+    classifier_specs = CONFIG.get("model", {}).get("classifiers", {})
+    model_paths = {
+        part_name: spec.get("weights", "")
+        for part_name, spec in classifier_specs.items()
+    }
+
+    return {
+        "status": "ok",
+        "time": utc_now_iso(),
+        "model_paths": model_paths,
+        "serial_enabled": CONFIG["serial"]["enabled"],
+        "serial_connected": service.signal_sender.is_connected(),
+        "queue_size": service.job_queue.qsize(),
+        "client_url": f"http://{CONFIG['client']['host']}:{CONFIG['client']['port']}",
+        "camera_agent": (
+            camera_agent_instance.get_health()
+            if camera_agent_instance is not None
+            else None
+        ),
+    }
+
+
+@app.get("/api/v1/cycles/{cycle_id}")
+def get_cycle(cycle_id: str):
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not started")
+
+    cycle_id = safe_component(cycle_id, "cycle_id")
+
+    cycle = service.database.get_cycle(cycle_id)
+
+    if not cycle:
+        raise HTTPException(status_code=404, detail="Cycle not found")
+
+    return cycle
+
+
+@app.post("/api/v1/images", status_code=202)
+async def upload_image(
+    image: UploadFile = File(...),
+    metadata: str = Form(...),
+):
+    if service is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Service not started",
+        )
+
+    try:
+        parsed_metadata = ImageMetadata.model_validate_json(metadata)
+
+    except Exception as ex:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid metadata: {ex}",
+        )
+
+    if parsed_metadata.step not in (1, 3):
+        raise HTTPException(
+            status_code=400,
+            detail="AI server chỉ nhận Step 1 hoặc Step 3",
+        )
+
+    received_date = datetime.now().strftime("%Y-%m-%d")
+
+    output_dir = (
+        service.raw_dir
+        / received_date
+        / parsed_metadata.camera_side
+        / parsed_metadata.tube_type
+        / parsed_metadata.cycle_id
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    temp_path = output_dir / (
+        f"{parsed_metadata.event_id}.uploading"
+    )
+
+    try:
+        sha256 = hashlib.sha256()
+        header = bytearray()
+
+        with open(temp_path, "wb") as f:
+            while True:
+                chunk = await image.read(1024 * 1024)
+
+                if not chunk:
+                    break
+
+                f.write(chunk)
+                sha256.update(chunk)
+
+                if len(header) < 32:
+                    remain = 32 - len(header)
+                    header.extend(chunk[:remain])
+
+        image_suffix = detect_image_suffix(bytes(header))
+
+        final_path = output_dir / (
+            f"{parsed_metadata.event_id}{image_suffix}"
+        )
+
+        os.replace(temp_path, final_path)
+
+        inserted = service.database.insert_image(
+            metadata=parsed_metadata,
+            image_path=str(final_path),
+            image_sha256=sha256.hexdigest(),
+            original_filename=sanitize_filename(image.filename),
+        )
+
+        if inserted:
+            service.enqueue_event(parsed_metadata.event_id)
+
+            LOGGER.info(
+                "Image received event=%s cycle=%s step=%s",
+                parsed_metadata.event_id,
+                parsed_metadata.cycle_id,
+                parsed_metadata.step,
+            )
+
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "received": True,
+                    "duplicate": False,
+                    "event_id": parsed_metadata.event_id,
+                    "cycle_id": parsed_metadata.cycle_id,
+                    "step": parsed_metadata.step,
+                },
+            )
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "received": True,
+                "duplicate": True,
+                "event_id": parsed_metadata.event_id,
+                "cycle_id": parsed_metadata.cycle_id,
+                "step": parsed_metadata.step,
+            },
+        )
+
+    except Exception as ex:
+        LOGGER.exception(
+            "Upload failed event=%s error=%s",
+            parsed_metadata.event_id,
+            ex,
+        )
+
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Upload failed: {ex}",
+        )
+
+
+@app.post("/api/v1/cycles/abort")
+def abort_cycle(request: AbortCycleRequest):
+    if service is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Service not started",
+        )
+
+    cycle, newly_aborted = service.database.abort_cycle(
+        cycle_id=request.cycle_id,
+        camera_side=request.camera_side,
+        tube_type=request.tube_type,
+        error_code=request.error_code,
+    )
+
+    return {
+        "accepted": True,
+        "newly_aborted": newly_aborted,
+        "cycle": cycle,
+    }
+
+
+# ============================================================
+# WEB GUI
+# ============================================================
+
+STATIC_DIR = Path(__file__).parent / "static"
+
+
+@app.get("/", include_in_schema=False)
+def index():
+    return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/api/v1/cycles", name="list_cycles")
+def list_cycles(limit: int = 50, offset: int = 0):
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not started")
+
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+
+    return {
+        "cycles": service.database.list_cycles(limit, offset),
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@app.get("/api/v1/cycles/{cycle_id}/images", name="cycle_images")
+def cycle_images(cycle_id: str):
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not started")
+
+    cycle_id = safe_component(cycle_id, "cycle_id")
+
+    cycle = service.database.get_cycle(cycle_id)
+
+    if not cycle:
+        raise HTTPException(status_code=404, detail="Cycle not found")
+
+    images = service.database.get_images_for_cycle(cycle_id)
+
+    for image in images:
+        if image["result_json"]:
+            try:
+                image["result"] = json.loads(image["result_json"])
+            except Exception:
+                image["result"] = None
+            del image["result_json"]
+
+    return {"cycle": cycle, "images": images}
+
+
+@app.get("/api/v1/images/{event_id}/annotated", name="annotated_image")
+def annotated_image(event_id: str):
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not started")
+
+    event_id = safe_component(event_id, "event_id")
+
+    event = service.database.get_image(event_id)
+
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    if not event["annotated_path"]:
+        raise HTTPException(status_code=404, detail="Annotated image not available")
+
+    path = Path(event["annotated_path"])
+
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Annotated image file missing")
+
+    return FileResponse(path, media_type="image/jpeg")
+
+
+@app.get("/api/v1/images/{event_id}/raw", name="raw_image")
+def raw_image(event_id: str):
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not started")
+
+    event_id = safe_component(event_id, "event_id")
+
+    event = service.database.get_image(event_id)
+
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    path = Path(event["image_path"])
+
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Raw image file missing")
+
+    return FileResponse(path, media_type="image/jpeg")
+
+
+@app.get("/api/v1/recent", name="recent_images")
+def recent_images(limit: int = 20):
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not started")
+
+    limit = max(1, min(limit, 100))
+
+    images = service.database.get_recent_images(limit)
+
+    for image in images:
+        if image["result_json"]:
+            try:
+                image["result"] = json.loads(image["result_json"])
+            except Exception:
+                image["result"] = None
+            del image["result_json"]
+
+    return {"images": images}
+
+
+@app.get("/api/v1/live", name="live_detection")
+def live_detection():
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not started")
+
+    images = service.database.get_latest_processed_by_side()
+
+    for image in images.values():
+        if image is None:
+            continue
+        if image["result_json"]:
+            try:
+                image["result"] = json.loads(image["result_json"])
+            except Exception:
+                image["result"] = None
+        del image["result_json"]
+
+    # Giu truong image cu de client dang dung API cu van hoat dong.
+    latest_image = max(
+        (image for image in images.values() if image is not None),
+        key=lambda image: image.get("processed_at") or "",
+        default=None,
+    )
+    return {"images": images, "image": latest_image}
+
+
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+# ============================================================
+# MERGED MODE: CAMERA AGENT (mount vào cùng app, cùng port)
+# ============================================================
+# Mount agent app ở CUỐI file:
+# - Route của main (đăng ký trước) được ưu tiên khi trùng path
+#   (ví dụ /health là của AI Server).
+# - Route agent giữ nguyên URL cũ như khi chạy riêng:
+#     GET  /api/v1/streams
+#     POST /api/v1/reset/{camera_side}
+#     POST /api/v1/inspection-result   (webhook Step 1 FAIL - loopback)
+# Mount "/" phải nằm sau cùng để không che route/static ở trên.
+app.mount("/", camera_agent_module.app)

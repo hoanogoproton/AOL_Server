@@ -1172,12 +1172,17 @@ class InspectionDatabase:
 
 class ArduinoSignalSender:
     """
-    Gửi tín hiệu đơn giản qua COM tới Arduino.
+    Gửi tín hiệu NG liên tục qua COM.
 
-    Giao thức: khi Step 3 phát hiện sản phẩm lỗi (NG) thì gửi b"0\r\n".
-    Không packet, không CRC, không SEQ, không chờ ACK (fire-and-forget).
-    Chỉ retry khi cổng COM lỗi (rút cáp, port bận...) — không có vòng
-    retry ở tầng DB/monitor.
+    Mặc định khi Step 3 phát hiện NG:
+    - Gửi b"0\r\n"
+    - Mỗi 0.1 giây gửi 1 lần
+    - Duy trì trong 2 giây
+    - Tổng cộng 20 lần gửi
+
+    Có thể thay đổi bằng config:
+    serial.ng_signal_duration_sec
+    serial.ng_signal_interval_sec
     """
 
     NG_SIGNAL = b"0\r\n"
@@ -1188,6 +1193,20 @@ class ArduinoSignalSender:
         self.baudrate = int(config["baudrate"])
         self.retry_count = int(config.get("retry_count", 3))
         self.retry_interval_sec = float(config.get("retry_interval_sec", 0.2))
+
+        # Giá trị mặc định theo yêu cầu: 2 giây, mỗi 0.1 giây một tín hiệu.
+        self.ng_signal_duration_sec = float(
+            config.get("ng_signal_duration_sec", 2.0)
+        )
+        self.ng_signal_interval_sec = float(
+            config.get("ng_signal_interval_sec", 0.1)
+        )
+
+        if self.ng_signal_duration_sec <= 0:
+            raise ValueError("ng_signal_duration_sec phải lớn hơn 0")
+
+        if self.ng_signal_interval_sec <= 0:
+            raise ValueError("ng_signal_interval_sec phải lớn hơn 0")
 
         self.serial_conn: Optional[serial.Serial] = None
         self.lock = threading.Lock()
@@ -1223,50 +1242,110 @@ class ArduinoSignalSender:
         except Exception:
             pass
 
+    def _write_ng_signal_once(self) -> bool:
+        """
+        Gửi một lần b"0\\r\\n", có retry khi COM bị lỗi.
+        Hàm này được gọi bên trong self.lock.
+        """
+        for attempt in range(1, self.retry_count + 1):
+            try:
+                self.ensure_open()
+
+                assert self.serial_conn is not None
+
+                self.serial_conn.write(self.NG_SIGNAL)
+                self.serial_conn.flush()
+
+                return True
+
+            except Exception as ex:
+                LOGGER.error(
+                    "Serial write failed attempt=%s: %s",
+                    attempt,
+                    ex,
+                )
+
+                try:
+                    if self.serial_conn is not None:
+                        self.serial_conn.close()
+                except Exception:
+                    pass
+
+                self.serial_conn = None
+
+                if attempt < self.retry_count:
+                    time.sleep(self.retry_interval_sec)
+
+        return False
+
     def send_ng_signal(self) -> bool:
         """
-        Gửi ký tự '0' báo Step 3 NG. True = đã ghi ra cổng thành công.
+        Gửi b"0\\r\\n" liên tục trong 2 giây, mặc định 1 lần/0.1 giây.
+
+        Với cấu hình mặc định:
+            2.0 / 0.1 = 20 lần gửi
+
+        Lần đầu được gửi ngay lập tức. Các lần sau được căn theo
+        time.monotonic() để hạn chế sai lệch do thời gian write/flush.
         """
         if not self.enabled:
             LOGGER.warning("Serial disabled. Skip NG signal (simulate sent).")
             return True
 
         with self.lock:
-            for attempt in range(1, self.retry_count + 1):
-                try:
-                    self.ensure_open()
-
-                    assert self.serial_conn is not None
-
-                    self.serial_conn.write(self.NG_SIGNAL)
-                    self.serial_conn.flush()
-
-                    LOGGER.info(
-                        "NG signal '0' sent to %s attempt=%s",
-                        self.port,
-                        attempt,
+            # Làm tròn lên để bảo đảm đủ số lần theo khoảng thời gian yêu cầu.
+            signal_count = max(
+                1,
+                int(
+                    round(
+                        self.ng_signal_duration_sec
+                        / self.ng_signal_interval_sec
                     )
-                    return True
+                ),
+            )
 
-                except Exception as ex:
+            LOGGER.warning(
+                "Start NG signal burst: port=%s duration=%.3fs "
+                "interval=%.3fs count=%s",
+                self.port,
+                self.ng_signal_duration_sec,
+                self.ng_signal_interval_sec,
+                signal_count,
+            )
+
+            start_time = time.monotonic()
+            sent_count = 0
+
+            for index in range(signal_count):
+                target_time = (
+                    start_time + index * self.ng_signal_interval_sec
+                )
+
+                # Chờ đến đúng mốc gửi, trừ lần đầu gửi ngay.
+                wait_sec = target_time - time.monotonic()
+                if wait_sec > 0:
+                    time.sleep(wait_sec)
+
+                if not self._write_ng_signal_once():
                     LOGGER.error(
-                        "Serial write failed attempt=%s: %s",
-                        attempt,
-                        ex,
+                        "NG signal burst stopped at %s/%s. COM=%s",
+                        sent_count,
+                        signal_count,
+                        self.port,
                     )
+                    return False
 
-                    try:
-                        if self.serial_conn is not None:
-                            self.serial_conn.close()
-                    except Exception:
-                        pass
+                sent_count += 1
 
-                    self.serial_conn = None
+            elapsed = time.monotonic() - start_time
 
-                time.sleep(self.retry_interval_sec)
-
-        LOGGER.error("NG signal FAILED after retries. COM=%s", self.port)
-        return False
+            LOGGER.warning(
+                "NG signal burst completed: sent=%s duration=%.3fs COM=%s",
+                sent_count,
+                elapsed,
+                self.port,
+            )
+            return True
 
 
 # ============================================================
