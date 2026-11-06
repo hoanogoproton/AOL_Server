@@ -215,10 +215,11 @@ camera_agent:
     cycle_timeout_sec: 1800
 
     # Nếu true: ảnh hợp lệ kế tiếp sẽ tự reset stream OUT_OF_SYNC thành
-    # RUNNING + Step 1 (không cần reset tay).
+    # READY_STEP1 (không cần reset tay).
     auto_recover_out_of_sync: true
 
-    # Nếu sequence lỗi, tự động reset khi agent khởi động lại.
+    # Không còn dùng: agent luôn khôi phục hàng đợi và ảnh đang chờ
+    # kết quả khi khởi động lại (không xoá state). Giữ để tương thích.
     auto_reset_on_startup: true
 
   storage:

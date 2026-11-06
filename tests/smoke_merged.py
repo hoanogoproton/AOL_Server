@@ -14,8 +14,8 @@ Step 3 -> upload loopback -> YOLO -> cycle OK (serial disabled: khong
 gui COM).
 
 Scenario "fail" (can server chay config_test_fail.yaml):
-anh Step 1 FAIL -> server webhook loopback /api/v1/inspection-result ->
-agent abort cycle + reset stream (next_step quay ve 1).
+anh Step 1 FAIL -> server luu ket qua + callback loopback
+/api/v1/inspection-result -> agent dong cycle, anh ke tiep la Step 1.
 """
 import argparse
 import sys
@@ -216,13 +216,13 @@ def main() -> int:
     )
     print("   OK: cycle SKIP")
 
-    print("== 4. Doi webhook loopback -> agent reset stream (next_step=1)...")
+    print("== 4. Doi callback loopback -> agent dong cycle, READY_STEP1...")
     wait_for(
         lambda: get_streams(base_url)["L"]["next_step"] == 1,
         timeout_sec=args.timeout,
-        desc="stream L reset sau webhook Step 1 FAIL",
+        desc="stream L ve Step 1 sau callback Step 1 FAIL",
     )
-    print("   OK: Webhook loopback + reset stream hoat dong")
+    print("   OK: Callback loopback + state machine hoat dong")
 
     print("\nSMOKE FAIL SCENARIO: ALL OK")
     return 0

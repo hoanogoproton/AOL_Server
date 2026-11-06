@@ -523,6 +523,23 @@ class InspectionDatabase:
 
                     CREATE INDEX IF NOT EXISTS idx_cycles_com
                     ON cycles(com_status);
+
+                    -- Outbox callback ket qua ve Camera Agent. Callback
+                    -- duoc ghi cung luc voi ket qua DB; neu gui that
+                    -- bai se duoc retry tu day (khong mat ket qua).
+                    CREATE TABLE IF NOT EXISTS client_callbacks (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        event_id TEXT UNIQUE NOT NULL,
+                        payload TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'PENDING',
+                        attempts INTEGER NOT NULL DEFAULT 0,
+                        last_error TEXT,
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        sent_at TEXT
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_client_callbacks_status
+                    ON client_callbacks(status);
                     """
                 )
                 conn.commit()
@@ -748,6 +765,92 @@ class InspectionDatabase:
             finally:
                 conn.close()
 
+    def claim_ng_signal(self, cycle_id: str) -> bool:
+        """
+        Danh dau mot cycle da duoc phep gui tin hieu NG (Step 3).
+
+        Tra ve False neu cycle da bi huy/SKIP, Step 1 FAIL, hoac tin hieu da
+        duoc gui truoc do. Claim duoc ghi truoc khi mo COM de tranh replay
+        ngoai y muon khi worker/process duoc chay lai.
+        """
+        with self.lock:
+            conn = self.connect()
+
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+
+                row = conn.execute(
+                    """
+                    SELECT final_result, step1_status, com_status
+                    FROM cycles
+                    WHERE cycle_id = ?
+                    """,
+                    (cycle_id,),
+                ).fetchone()
+
+                if row is None:
+                    conn.rollback()
+                    return False
+
+                if row["final_result"] in ("SKIP", "ABORTED"):
+                    conn.rollback()
+                    return False
+
+                if row["step1_status"] not in (None, "PASS"):
+                    conn.rollback()
+                    return False
+
+                if row["com_status"] in (
+                    "SENDING", "ACK", "UNCONFIRMED", "UNKNOWN",
+                ):
+                    conn.rollback()
+                    return False
+
+                cursor = conn.execute(
+                    """
+                    UPDATE cycles
+                    SET
+                        com_status = 'SENDING',
+                        com_updated_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE cycle_id = ?
+                    AND COALESCE(com_status, 'NONE') = ?
+                    """,
+                    (cycle_id, row["com_status"] or "NONE"),
+                )
+
+                conn.commit()
+                return cursor.rowcount == 1
+
+            except Exception:
+                conn.rollback()
+                raise
+
+            finally:
+                conn.close()
+
+    def set_cycle_com_status(self, cycle_id: str, status: str) -> None:
+        """Ghi trang thai delivery cua tin hieu NG: ACK/UNCONFIRMED/UNKNOWN."""
+        with self.lock:
+            conn = self.connect()
+
+            try:
+                conn.execute(
+                    """
+                    UPDATE cycles
+                    SET
+                        com_status = ?,
+                        com_updated_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE cycle_id = ?
+                    """,
+                    (status, cycle_id),
+                )
+                conn.commit()
+
+            finally:
+                conn.close()
+
     def finalize_if_ready(self, cycle_id: str) -> Optional[dict]:
         """
         Chỉ final sau khi đã có kết quả cả Step 1 và Step 3.
@@ -800,7 +903,18 @@ class InspectionDatabase:
                             final_error = row["step1_error"] or "E110_PRE_GLUE_FAIL"
                         else:
                             final_error = row["step3_error"] or "E300_FINAL_INSPECTION_FAIL"
-                    com_status = "PENDING"
+
+                    # Tin hieu NG Step 3 co the da duoc gui truoc khi finalize.
+                    # Khong ghi de trang thai delivery da co bang PENDING.
+                    if row["com_status"] == "SENDING":
+                        # Da claim nhung chua ghi duoc ket qua ACK/UNCONFIRMED.
+                        com_status = "UNKNOWN"
+                    elif row["com_status"] in (
+                        "ACK", "UNCONFIRMED", "UNKNOWN",
+                    ):
+                        com_status = row["com_status"]
+                    else:
+                        com_status = "PENDING"
 
                 cursor = conn.execute(
                     """
@@ -1162,6 +1276,128 @@ class InspectionDatabase:
             except Exception:
                 conn.rollback()
                 raise
+            finally:
+                conn.close()
+
+
+    def queue_client_callback(self, event_id: str, payload: dict) -> Optional[int]:
+        """Ghi callback vao outbox (idempotent theo event_id)."""
+        with self.lock:
+            conn = self.connect()
+
+            try:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO client_callbacks (
+                        event_id,
+                        payload,
+                        status
+                    )
+                    VALUES (?, ?, 'PENDING')
+                    """,
+                    (
+                        event_id,
+                        json.dumps(payload, ensure_ascii=False),
+                    ),
+                )
+
+                row = conn.execute(
+                    """
+                    SELECT id, status
+                    FROM client_callbacks
+                    WHERE event_id = ?
+                    """,
+                    (event_id,),
+                ).fetchone()
+
+                conn.commit()
+
+                if row is None:
+                    return None
+
+                return row["id"]
+
+            except Exception:
+                conn.rollback()
+                raise
+
+            finally:
+                conn.close()
+
+    def get_pending_client_callbacks(self, limit: int = 50) -> list[dict]:
+        with self.lock:
+            conn = self.connect()
+
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM client_callbacks
+                    WHERE status IN ('PENDING', 'RETRY')
+                    ORDER BY id ASC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+
+                return [dict(row) for row in rows]
+
+            finally:
+                conn.close()
+
+    def get_client_callback(self, callback_id: int) -> Optional[dict]:
+        with self.lock:
+            conn = self.connect()
+
+            try:
+                row = conn.execute(
+                    """
+                    SELECT *
+                    FROM client_callbacks
+                    WHERE id = ?
+                    """,
+                    (callback_id,),
+                ).fetchone()
+
+                return dict(row) if row else None
+
+            finally:
+                conn.close()
+
+    def mark_client_callback_result(
+        self,
+        callback_id: int,
+        success: bool,
+        error_message: Optional[str] = None,
+    ) -> None:
+        with self.lock:
+            conn = self.connect()
+
+            try:
+                status = "ACK" if success else "RETRY"
+
+                conn.execute(
+                    """
+                    UPDATE client_callbacks
+                    SET
+                        status = ?,
+                        attempts = attempts + 1,
+                        last_error = ?,
+                        sent_at = CASE
+                            WHEN ? = 1 THEN CURRENT_TIMESTAMP
+                            ELSE sent_at
+                        END
+                    WHERE id = ?
+                    """,
+                    (
+                        status,
+                        error_message,
+                        1 if success else 0,
+                        callback_id,
+                    ),
+                )
+                conn.commit()
+
             finally:
                 conn.close()
 
@@ -1564,6 +1800,10 @@ class InspectionService:
             else ArduinoSignalSender(config["serial"])
         )
 
+        # Bao ve quyet dinh gui NG Step 3: moi event chi gui toi da 1 lan.
+        self._ng_signal_lock = threading.Lock()
+        self._ng_signal_events: set[str] = set()
+
         self.classifier_models: dict[str, YOLO] = {}
 
         self.job_queue: queue.Queue[str] = queue.Queue()
@@ -1572,6 +1812,7 @@ class InspectionService:
         self.worker_thread: Optional[threading.Thread] = None
         self.monitor_thread: Optional[threading.Thread] = None
         self.cleanup_thread: Optional[threading.Thread] = None
+        self.callback_thread: Optional[threading.Thread] = None
 
     def get_classifier_specs(self) -> dict[str, dict]:
         model_cfg = self.config.get("model", {})
@@ -1610,6 +1851,13 @@ class InspectionService:
         )
         self.monitor_thread.start()
 
+        self.callback_thread = threading.Thread(
+            target=self.callback_loop,
+            name="Client-Callback",
+            daemon=True,
+        )
+        self.callback_thread.start()
+
         if self.image_retention_days > 0:
             self.cleanup_thread = threading.Thread(
                 target=self.cleanup_loop,
@@ -1632,6 +1880,9 @@ class InspectionService:
 
         if self.monitor_thread:
             self.monitor_thread.join(timeout=5)
+
+        if self.callback_thread:
+            self.callback_thread.join(timeout=5)
 
         if self.cleanup_thread:
             self.cleanup_thread.join(timeout=5)
@@ -2083,6 +2334,255 @@ class InspectionService:
                     "Failed to write STEP3 CSV to %s: %s", log_dir, ex
                 )
 
+    def _request_step3_ng_signal(
+        self,
+        event: dict,
+        error_code: str,
+        reason: str,
+    ) -> Optional[str]:
+        """
+        Quyet dinh duy nhat cho tin hieu NG cua Step 3.
+
+        Goi cho ca ket qua classifier NG lan loi ky thuat (doc anh, sai
+        kich thuoc, inference, ghi annotation). Tin hieu khong phu thuoc
+        vao viec annotation/archive thanh cong hay that bai.
+
+        Moi event chi gui toi da 1 lan. Cycle da SKIP/ABORTED, Step 1 FAIL,
+        hoac da co trang thai delivery truoc do se khong gui lai.
+        """
+        event_id = str(event.get("event_id") or "")
+        cycle_id = str(event.get("cycle_id") or "")
+
+        if int(event.get("step", 0)) != 3:
+            return None
+
+        if not event_id or not cycle_id:
+            LOGGER.error(
+                "Khong gui tin hieu NG: thieu event_id/cycle_id event=%s cycle=%s",
+                event_id,
+                cycle_id,
+            )
+            return None
+
+        signal_lock = getattr(self, "_ng_signal_lock", None)
+        if signal_lock is None:
+            signal_lock = threading.Lock()
+            self._ng_signal_lock = signal_lock
+
+        signaled_events = getattr(self, "_ng_signal_events", None)
+        if signaled_events is None:
+            signaled_events = set()
+            self._ng_signal_events = signaled_events
+
+        with signal_lock:
+            if event_id in signaled_events:
+                LOGGER.warning(
+                    "Bo qua tin hieu NG Step 3 (da gui truoc do): event=%s cycle=%s",
+                    event_id,
+                    cycle_id,
+                )
+                return None
+
+            claim = getattr(self.database, "claim_ng_signal", None)
+
+            if callable(claim):
+                try:
+                    claimed = bool(claim(cycle_id))
+                except Exception:
+                    LOGGER.exception(
+                        "Khong claim duoc tin hieu NG; bo qua de tranh replay: "
+                        "event=%s cycle=%s",
+                        event_id,
+                        cycle_id,
+                    )
+                    return None
+
+                if not claimed:
+                    LOGGER.warning(
+                        "Bo qua tin hieu NG Step 3: cycle khong con hop le hoac "
+                        "da gui/khong xac dinh event=%s cycle=%s",
+                        event_id,
+                        cycle_id,
+                    )
+                    return None
+            else:
+                # Fallback cho database gia trong unit test khong co claim.
+                get_cycle = getattr(self.database, "get_cycle", None)
+                if callable(get_cycle):
+                    try:
+                        cycle = get_cycle(cycle_id)
+                    except Exception:
+                        LOGGER.exception(
+                            "Khong doc duoc cycle de kiem tra tin hieu NG: %s",
+                            cycle_id,
+                        )
+                        cycle = None
+
+                    if cycle is not None:
+                        if (
+                            cycle.get("final_result") in ("SKIP", "ABORTED")
+                            or cycle.get("step1_status") not in (None, "PASS")
+                            or cycle.get("com_status") in (
+                                "SENDING", "ACK", "UNCONFIRMED", "UNKNOWN",
+                            )
+                        ):
+                            LOGGER.warning(
+                                "Bo qua tin hieu NG Step 3: cycle khong con hop le "
+                                "hoac da gui/khong xac dinh event=%s cycle=%s "
+                                "final=%s step1=%s com=%s",
+                                event_id,
+                                cycle_id,
+                                cycle.get("final_result"),
+                                cycle.get("step1_status"),
+                                cycle.get("com_status"),
+                            )
+                            return None
+
+            signaled_events.add(event_id)
+
+            LOGGER.warning(
+                "Step 3 NG -> gui tin hieu COM: event=%s cycle=%s reason=%s error=%s",
+                event_id,
+                cycle_id,
+                reason,
+                error_code,
+            )
+
+            try:
+                confirmed = bool(self.signal_sender.send_ng_signal())
+            except Exception:
+                confirmed = False
+                LOGGER.exception(
+                    "Gui tin hieu NG Step 3 that bai: event=%s cycle=%s",
+                    event_id,
+                    cycle_id,
+                )
+
+            delivery_status = "ACK" if confirmed else "UNCONFIRMED"
+
+            set_com_status = getattr(
+                self.database, "set_cycle_com_status", None
+            )
+            if callable(set_com_status):
+                try:
+                    set_com_status(cycle_id, delivery_status)
+                except Exception:
+                    LOGGER.exception(
+                        "Khong ghi duoc trang thai COM %s: cycle=%s",
+                        delivery_status,
+                        cycle_id,
+                    )
+
+            if confirmed:
+                LOGGER.warning(
+                    "STEP3 NG CONFIRMED by Arduino: event=%s cycle=%s COM=%s",
+                    event_id,
+                    cycle_id,
+                    getattr(self.signal_sender, "port", "?"),
+                )
+            else:
+                LOGGER.critical(
+                    "STEP3 NG NOT CONFIRMED by Arduino: event=%s cycle=%s COM=%s "
+                    "delivery=%s (relay state UNKNOWN/UNCONFIRMED); no automatic "
+                    "replay. Check relay/COM; inspection result remains NG.",
+                    event_id,
+                    cycle_id,
+                    getattr(self.signal_sender, "port", "?"),
+                    delivery_status,
+                )
+
+            return delivery_status
+
+    def _apply_inspection_result(
+        self,
+        event: dict,
+        step: int,
+        step_status: str,
+        error_code: str,
+        result_payload: dict,
+        annotated_path: Optional[str],
+        image_status: str,
+    ) -> None:
+        """Ghi ket qua event/cycle va finalize theo mot duong xu ly chung."""
+        event_id = event["event_id"]
+        cycle_id = event["cycle_id"]
+
+        if step == 1 and step_status == "FAIL":
+            # Danh dau cycle SKIP truoc khi anh thanh DONE. Neu khong,
+            # liveview co the doc trung khoang anh FAIL da DONE nhung
+            # cycle chua kip SKIP.
+            self.database.set_cycle_step_result(
+                cycle_id=cycle_id,
+                step=1,
+                status="FAIL",
+                error_code=error_code,
+            )
+            self.database.abort_cycle_s1_fail(
+                cycle_id=cycle_id,
+                error_code=error_code,
+            )
+            self.database.update_image_result(
+                event_id=event_id,
+                image_status=image_status,
+                result_json=result_payload,
+                annotated_path=annotated_path,
+                error_code=error_code,
+            )
+            self.notify_client_result(
+                event,
+                step=1,
+                step_status=step_status,
+                error_code=error_code,
+                processing_error=(image_status == "ERROR"),
+            )
+            LOGGER.info(
+                "Step 1 FAIL, cycle SKIP cycle=%s error=%s image_status=%s",
+                cycle_id,
+                error_code,
+                image_status,
+            )
+            return
+
+        self.database.update_image_result(
+            event_id=event_id,
+            image_status=image_status,
+            result_json=result_payload,
+            annotated_path=annotated_path,
+            error_code=error_code,
+        )
+        self.database.set_cycle_step_result(
+            cycle_id=cycle_id,
+            step=step,
+            status=step_status,
+            error_code=error_code,
+        )
+
+        LOGGER.info(
+            "Inspection done event=%s cycle=%s step=%s status=%s "
+            "error=%s image_status=%s",
+            event_id,
+            cycle_id,
+            step,
+            step_status,
+            error_code,
+            image_status,
+        )
+
+        final_cycle = self.database.finalize_if_ready(cycle_id)
+
+        # Chi gui callback SAU khi ket qua da ghi DB. HTTP 202 luc upload
+        # khong bao gio duoc dung de mo khoa anh ke tiep.
+        self.notify_client_result(
+            event,
+            step=step,
+            step_status=step_status,
+            error_code=error_code,
+            processing_error=(image_status == "ERROR"),
+        )
+
+        if final_cycle and step == 3:
+            self.log_step3_csv(final_cycle, event)
+
     def process_event(self, event_id: str) -> None:
         event = self.database.get_image(event_id)
 
@@ -2118,27 +2618,20 @@ class InspectionService:
                 evaluation,
             )
 
-            annotated_path = self.create_annotated_image(
-                raw_image=raw_image,
-                classifier_results=classifier_results,
-                evaluation=evaluation,
-                event=event,
-            )
+            if step == 1:
+                step_status = "PASS" if evaluation["passed"] else "FAIL"
+            else:
+                step_status = "OK" if evaluation["passed"] else "NG"
 
-            # Ket qua NG/FAIL (Step 1 FAIL + Step 3 NG): copy anh
-            # annotated + raw sang thu muc NG (network share). Anh OK
-            # chi ton tai tren may local theo thoi han
-            # 'storage.image_retention_days' (xem cleanup_old_images).
-            if not evaluation["passed"]:
-                self.save_ng_screenshot(annotated_path, event)
-
-                if step == 3:
-                    if not self.signal_sender.send_ng_signal():
-                        LOGGER.critical(
-                            "STEP3 NG NOT CONFIRMED by Arduino: event=%s cycle=%s "
-                            "COM=%s. Check relay/COM; inspection result remains NG.",
-                            event_id, event["cycle_id"], self.signal_sender.port,
-                        )
+            # Step 3 NG phai gui tin hieu NG truoc khi annotation/archive
+            # duoc thuc hien: loi ghi anh khong duoc lam mat lenh fail-safe.
+            signal_status = None
+            if step == 3 and step_status == "NG":
+                signal_status = self._request_step3_ng_signal(
+                    event,
+                    error_code,
+                    reason="classifier",
+                )
 
             result_payload = {
                 "event_id": event_id,
@@ -2156,68 +2649,32 @@ class InspectionService:
                 "error_code": error_code,
             }
 
-            if step == 1:
-                step_status = "PASS" if evaluation["passed"] else "FAIL"
-            else:
-                step_status = "OK" if evaluation["passed"] else "NG"
+            if signal_status is not None:
+                result_payload["ng_signal_status"] = signal_status
 
-            if step == 1 and step_status == "FAIL":
-                # Danh dau cycle SKIP truoc khi anh thanh DONE. Neu khong,
-                # liveview co the doc trung khoang anh FAIL da DONE nhung
-                # cycle chua kip SKIP.
-                self.database.set_cycle_step_result(
-                    cycle_id=event["cycle_id"],
-                    step=1,
-                    status="FAIL",
-                    error_code=error_code,
-                )
-                self.database.abort_cycle_s1_fail(
-                    cycle_id=event["cycle_id"],
-                    error_code=error_code,
-                )
-                self.database.update_image_result(
-                    event_id=event_id,
-                    image_status="DONE",
-                    result_json=result_payload,
-                    annotated_path=annotated_path,
-                    error_code=error_code,
-                )
-                self.notify_client_step1_result(event, step_status, error_code)
-                LOGGER.info(
-                    "Step 1 FAIL, cycle SKIP cycle=%s error=%s",
-                    event["cycle_id"],
-                    error_code,
-                )
-            else:
-                self.database.update_image_result(
-                    event_id=event_id,
-                    image_status="DONE",
-                    result_json=result_payload,
-                    annotated_path=annotated_path,
-                    error_code=error_code,
-                )
-                self.database.set_cycle_step_result(
-                    cycle_id=event["cycle_id"],
-                    step=step,
-                    status=step_status,
-                    error_code=error_code,
-                )
+            annotated_path = self.create_annotated_image(
+                raw_image=raw_image,
+                classifier_results=classifier_results,
+                evaluation=evaluation,
+                event=event,
+            )
 
-                LOGGER.info(
-                    "Inspection done event=%s cycle=%s step=%s status=%s error=%s",
-                    event_id,
-                    event["cycle_id"],
-                    step,
-                    step_status,
-                    error_code,
-                )
+            # Ket qua NG/FAIL (Step 1 FAIL + Step 3 NG): copy anh
+            # annotated + raw sang thu muc NG (network share). Anh OK
+            # chi ton tai tren may local theo thoi han
+            # 'storage.image_retention_days' (xem cleanup_old_images).
+            if not evaluation["passed"]:
+                self.save_ng_screenshot(annotated_path, event)
 
-                final_cycle = self.database.finalize_if_ready(
-                    event["cycle_id"]
-                )
-
-                if final_cycle and step == 3:
-                    self.log_step3_csv(final_cycle, event)
+            self._apply_inspection_result(
+                event=event,
+                step=step,
+                step_status=step_status,
+                error_code=error_code,
+                result_payload=result_payload,
+                annotated_path=annotated_path,
+                image_status="DONE",
+            )
 
         except Exception as ex:
             LOGGER.error(
@@ -2229,6 +2686,16 @@ class InspectionService:
 
             error_code = "E301_INFERENCE_OR_IMAGE_ERROR"
 
+            # Loi ky thuat o Step 3 van la NG: gui tin hieu truoc khi ghi DB.
+            # Neu tin hieu da gui o nhanh classifier, helper se bo qua.
+            signal_status = None
+            if step == 3:
+                signal_status = self._request_step3_ng_signal(
+                    event,
+                    error_code,
+                    reason="exception",
+                )
+
             error_payload = {
                 "event_id": event_id,
                 "cycle_id": event["cycle_id"],
@@ -2238,72 +2705,172 @@ class InspectionService:
                 "processed_at": utc_now_iso(),
             }
 
-            self.database.update_image_result(
-                event_id=event_id,
-                image_status="ERROR",
-                result_json=error_payload,
-                annotated_path=None,
+            if signal_status is not None:
+                error_payload["ng_signal_status"] = signal_status
+
+            self._apply_inspection_result(
+                event=event,
+                step=step,
+                step_status="FAIL" if step == 1 else "NG",
                 error_code=error_code,
+                result_payload=error_payload,
+                annotated_path=None,
+                image_status="ERROR",
             )
 
-            if step == 1:
-                step_status = "FAIL"
-                self.database.set_cycle_step_result(
-                    cycle_id=event["cycle_id"],
-                    step=1,
-                    status="FAIL",
-                    error_code=error_code,
-                )
-                self.database.abort_cycle_s1_fail(
-                    cycle_id=event["cycle_id"],
-                    error_code=error_code,
-                )
-                self.notify_client_step1_result(event, step_status, error_code)
-                LOGGER.info(
-                    "Step 1 FAIL (exception), cycle SKIP cycle=%s error=%s",
-                    event["cycle_id"],
-                    error_code,
-                )
-            else:
-                step_status = "NG"
+    def notify_client_result(
+        self,
+        event: dict,
+        step: int,
+        step_status: str,
+        error_code: str,
+        processing_error: bool = False,
+    ) -> None:
+        """
+        Ghi callback vao outbox va gui ngay (retry sau neu that bai).
 
-                self.database.set_cycle_step_result(
-                    cycle_id=event["cycle_id"],
-                    step=step,
-                    status=step_status,
-                    error_code=error_code,
-                )
+        Callback duoc goi SAU khi ket qua AI da duoc luu DB. Payload co
+        du ca PASS/FAIL (Step 1) va OK/NG (Step 3).
+        """
+        config = getattr(self, "config", None) or {}
+        client_cfg = config.get("client")
 
-                final_cycle = self.database.finalize_if_ready(
-                    event["cycle_id"]
-                )
+        if not client_cfg:
+            # Standalone/unit-test khong cau hinh client -> bo qua.
+            return
 
-                if final_cycle and step == 3:
-                    self.log_step3_csv(final_cycle, event)
-
-    def notify_client_step1_result(self, event: dict, step_status: str, error_code: str) -> None:
-        client_cfg = self.config["client"]
-        url = f"http://{client_cfg['host']}:{client_cfg['port']}/api/v1/inspection-result"
         payload = {
             "event_id": event["event_id"],
             "cycle_id": event["cycle_id"],
             "camera_side": event["camera_side"],
             "tube_type": event["tube_type"],
-            "step": 1,
-            "passed": step_status == "PASS",
-            "error_code": error_code,
+            "step": int(step),
+            "status": step_status,
+            "passed": step_status in ("PASS", "OK"),
+            "error_code": error_code or "",
+            "processing_error": bool(processing_error),
         }
-        for attempt in range(1, 4):
+
+        database = getattr(self, "database", None)
+        queue_callback = getattr(
+            database, "queue_client_callback", None
+        )
+
+        if not callable(queue_callback):
+            # Fallback cho DB gia trong unit test.
+            self._post_client_callback(payload)
+            return
+
+        callback_id = queue_callback(event["event_id"], payload)
+
+        if callback_id is None:
+            return
+
+        self._deliver_client_callback(callback_id)
+
+    def notify_client_step1_result(
+        self,
+        event: dict,
+        step_status: str,
+        error_code: str,
+    ) -> None:
+        """Tuong thich API cu."""
+        self.notify_client_result(
+            event,
+            step=1,
+            step_status=step_status,
+            error_code=error_code,
+        )
+
+    def _post_client_callback(self, payload: dict) -> bool:
+        config = getattr(self, "config", None) or {}
+        client_cfg = config.get("client")
+
+        if not client_cfg:
+            return False
+
+        url = (
+            f"http://{client_cfg['host']}:{client_cfg['port']}"
+            "/api/v1/inspection-result"
+        )
+
+        try:
+            resp = requests.post(url, json=payload, timeout=3)
+
+            if resp.ok:
+                LOGGER.info(
+                    "Webhook result sent event=%s step=%s status=%s",
+                    payload.get("event_id"),
+                    payload.get("step"),
+                    payload.get("status"),
+                )
+                return True
+
+            LOGGER.warning(
+                "Webhook result HTTP=%s event=%s body=%s",
+                resp.status_code,
+                payload.get("event_id"),
+                resp.text[:200],
+            )
+            return False
+
+        except Exception as ex:
+            LOGGER.warning(
+                "Webhook result failed event=%s error=%s",
+                payload.get("event_id"),
+                ex,
+            )
+            return False
+
+    def _deliver_client_callback(self, callback_id: int) -> None:
+        database = getattr(self, "database", None)
+        get_callback = getattr(
+            database, "get_client_callback", None
+        )
+        mark_result = getattr(
+            database, "mark_client_callback_result", None
+        )
+
+        if not callable(get_callback) or not callable(mark_result):
+            return
+
+        row = get_callback(callback_id)
+
+        if row is None or row["status"] in ("ACK",):
+            return
+
+        try:
+            payload = json.loads(row["payload"])
+        except Exception:
+            mark_result(
+                callback_id,
+                False,
+                "Invalid callback payload JSON",
+            )
+            return
+
+        success = self._post_client_callback(payload)
+        mark_result(
+            callback_id,
+            success,
+            None if success else "Webhook delivery failed",
+        )
+
+    def callback_loop(self) -> None:
+        """Retry callback ton dong trong outbox moi giay."""
+        while not self.stop_event.is_set():
             try:
-                resp = requests.post(url, json=payload, timeout=3)
-                if resp.ok:
-                    LOGGER.info("Webhook S1 result sent to client cycle=%s passed=%s", event["cycle_id"], step_status == "PASS")
-                    return
-            except Exception as ex:
-                LOGGER.warning("Webhook attempt %d failed: %s", attempt, ex)
-                if attempt < 3:
-                    time.sleep(0.5)
-        LOGGER.error("Webhook S1 result FAILED after 3 retries cycle=%s", event["cycle_id"])
+                rows = self.database.get_pending_client_callbacks()
+
+                for row in rows:
+                    if self.stop_event.is_set():
+                        return
+                    self._deliver_client_callback(row["id"])
+
+            except Exception:
+                LOGGER.exception("Callback loop error")
+
+            self.stop_event.wait(1.0)
 
 
 # ============================================================
@@ -2648,6 +3215,50 @@ def cycle_images(cycle_id: str):
     return {"cycle": cycle, "images": images}
 
 
+@app.get(
+    "/api/v1/events/{event_id}/result",
+    name="event_result",
+)
+def event_result(event_id: str):
+    """Tra ket qua da luu DB cho Camera Agent truy van lai khi mat callback."""
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not started")
+
+    event_id = safe_component(event_id, "event_id")
+
+    image = service.database.get_image(event_id)
+
+    if not image:
+        return {"found": False, "event_id": event_id}
+
+    step = int(image["step"])
+    cycle = service.database.get_cycle(image["cycle_id"])
+
+    status = None
+    error_code = None
+
+    if cycle is not None:
+        if step == 1:
+            status = cycle.get("step1_status")
+            error_code = cycle.get("step1_error")
+        else:
+            status = cycle.get("step3_status")
+            error_code = cycle.get("step3_error")
+
+    return {
+        "found": True,
+        "event_id": event_id,
+        "cycle_id": image["cycle_id"],
+        "camera_side": image["camera_side"],
+        "tube_type": image["tube_type"],
+        "step": step,
+        "status": status,
+        "error_code": error_code,
+        "image_status": image["image_status"],
+        "processing_error": image["image_status"] == "ERROR",
+    }
+
+
 @app.get("/api/v1/images/{event_id}/annotated", name="annotated_image")
 def annotated_image(event_id: str):
     if service is None:
@@ -2749,6 +3360,6 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 # - Route agent giữ nguyên URL cũ như khi chạy riêng:
 #     GET  /api/v1/streams
 #     POST /api/v1/reset/{camera_side}
-#     POST /api/v1/inspection-result   (webhook Step 1 FAIL - loopback)
+#     POST /api/v1/inspection-result   (callback ket qua AI - loopback)
 # Mount "/" phải nằm sau cùng để không che route/static ở trên.
 app.mount("/", camera_agent_module.app)

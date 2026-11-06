@@ -5,9 +5,27 @@ Từ bản gộp này, **một process duy nhất** (1 port `8080`) vừa chạy
 - **AI Server**: nhận ảnh upload, chạy YOLO + ROI rules, gửi tín hiệu `'0'`
   qua COM Arduino khi **Step 3 NG**, Web GUI quan sát.
 - **Camera Agent** (`camera_agent.py`): theo dõi thư mục ảnh camera (**network share** hoặc local),
-  quản lý sequence Step 1→3 (**2 ảnh mỗi chu trình**: ảnh 1 = Step 1 mốc + detect bước 1,
-  ảnh 2 = detect chính Step 3), upload ảnh lên AI Server qua loopback,
-  nhận webhook Step 1 FAIL để abort cycle + reset stream.
+  nhận ảnh vào **hàng đợi bền vững trong SQLite** trước, chỉ gán step khi stream
+  `(camera_side, tube_type)` đang rảnh, upload ảnh lên AI Server qua loopback và
+  nhận callback kết quả cho **cả 4 trường hợp** Step 1 PASS/FAIL, Step 3 OK/NG.
+
+### State machine sequence (1 ảnh đang chờ / stream)
+
+| Ảnh đang xử lý | Kết quả | Ảnh tiếp theo |
+|---|---|---|
+| STEP 1 | FAIL | STEP 1 (cycle mới) |
+| STEP 1 | PASS | STEP 3 (cùng cycle) |
+| STEP 3 | OK hoặc NG | STEP 1 (cycle mới) |
+
+- Ảnh đến khi stream đang chờ kết quả được giữ nguyên trong hàng đợi FIFO,
+  **không bị hủy** và **không bị gán Step 3 sớm**.
+- Mỗi stream độc lập: `L/No01` FAIL không ảnh hưởng `R/No01` hay `L/No02`.
+- Chỉ callback kết quả AI đã lưu DB mới mở khóa ảnh tiếp theo; HTTP 202 lúc
+  upload **không** dùng để mở khóa. Callback lỗi được lưu outbox + retry; agent
+  còn truy vấn lại `/api/v1/events/{event_id}/result` nếu callback bị mất.
+- Agent restart khôi phục hàng đợi và event đang chờ từ DB.
+- Step 1 FAIL kết thúc cycle với `final_result=SKIP` (UI hiển thị
+  `STEP1_FAIL`), không gửi tín hiệu NG COM; ảnh kế tiếp vẫn là Step 1.
 
 ## Cài thư viện
 
@@ -40,7 +58,8 @@ hoặc double-click `start_server.bat`.
 | Streams của agent | http://localhost:8080/api/v1/streams |
 | Reset sequence tay | POST http://localhost:8080/api/v1/reset/L (hoặc /R) |
 | Upload ảnh (agent tự gọi - loopback) | POST /api/v1/images |
-| Webhook Step 1 FAIL (loopback) | POST /api/v1/inspection-result |
+| Callback kết quả AI (loopback) | POST /api/v1/inspection-result |
+| Truy vấn lại kết quả đã lưu (loopback) | GET /api/v1/events/{event_id}/result |
 | Abort cycle (agent tự gọi - loopback) | POST /api/v1/cycles/abort |
 
 ## Tự mở trình duyệt khi server chạy thành công (mới)
@@ -117,7 +136,8 @@ khởi chạy **thành công**:
     chu ky), `start_grace_sec` (bu lech gio giua 2 may).
 
   - `ai_server.base_url` luôn là `http://127.0.0.1:8080` (loopback tới chính nó).
-- Section `client`: để `127.0.0.1:8080` (webhook Step 1 FAIL loopback).
+- Section `client`: để `127.0.0.1:8080` (callback kết quả loopback; callback
+  lỗi được retry từ outbox trong DB của AI Server).
 - `serial`: COM port của Arduino cắm vào máy này. Logic đã đơn giản:
   chỉ gửi ký tự `'0'` (kèm `\r\n`) khi **Step 3 NG** — không ACK, không CRC.
   Sketch Arduino mẫu: `arduino/ng_signal_receiver.ino`.
@@ -145,7 +165,7 @@ $env:AI_CONFIG="config_test.yaml"; .\.venv\Scripts\python.exe run.py     # liste
 .\.venv\Scripts\python.exe tests\smoke_merged.py --scenario pass --base-url http://127.0.0.1:8180
 ```
 
-Scenario 2 — Step 1 FAIL (webhook loopback + abort + reset stream):
+Scenario 2 — Step 1 FAIL (callback loopback, cycle SKIP, ảnh kế tiếp vẫn Step 1):
 
 ```
 $env:AI_CONFIG="config_test_fail.yaml"; .\.venv\Scripts\python.exe run.py   # listen 8181

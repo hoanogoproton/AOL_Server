@@ -204,8 +204,8 @@ class CameraAgentDatabase:
             try:
                 # Migration: schema streams cu dung PK camera_side duy
                 # nhat (mot row / side, co cot active_no) - khong cho
-                # phep nhieu No chay song song. State stream la
-                # transient (auto_reset_on_startup) nen DROP la an toan.
+                # phep nhieu No chay song song. Schema cu khong the anh
+                # xa sang (camera_side, tube_type) nen tao lai tu dau.
                 existing_columns = {
                     row["name"]
                     for row in conn.execute(
@@ -240,6 +240,12 @@ class CameraAgentDatabase:
 
                         state TEXT NOT NULL DEFAULT 'OUT_OF_SYNC',
 
+                        -- Anh dang cho ket qua AI cua stream nay. Chi mot
+                        -- event duoc phep "active" tai mot thoi diem.
+                        active_event_id TEXT,
+                        active_step INTEGER,
+                        result_wait_since REAL,
+
                         last_event_unix REAL,
                         last_file_path TEXT,
                         last_capture_timestamp TEXT,
@@ -266,8 +272,36 @@ class CameraAgentDatabase:
                         upload_attempts INTEGER NOT NULL DEFAULT 0,
                         last_upload_error TEXT,
 
+                        -- Ket qua cuoi cung tra ve tu AI Server. NULL =
+                        -- chua co ket qua (stream phai tiep tuc cho).
+                        result_status TEXT,
+                        result_error_code TEXT,
+                        processing_error INTEGER NOT NULL DEFAULT 0,
+                        result_received_at TEXT,
+
                         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                         uploaded_at TEXT
+                    );
+
+                    -- Hang doi anh ben vung: anh duoc nhan ngay khi file
+                    -- on dinh, nhung CHUA duoc gan step cho den khi stream
+                    -- cua no ranh (khong con anh nao cho ket qua AI).
+                    CREATE TABLE IF NOT EXISTS pending_images (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                        file_path TEXT UNIQUE NOT NULL,
+                        file_name TEXT NOT NULL,
+
+                        camera_side TEXT NOT NULL,
+                        tube_type TEXT NOT NULL,
+
+                        observed_at TEXT NOT NULL,
+
+                        status TEXT NOT NULL DEFAULT 'QUEUED',
+                        event_id TEXT,
+                        assigned_at TEXT,
+
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                     );
 
                     CREATE TABLE IF NOT EXISTS seen_files (
@@ -293,18 +327,160 @@ class CameraAgentDatabase:
                     CREATE INDEX IF NOT EXISTS idx_events_upload
                     ON events(upload_status);
 
+                    CREATE INDEX IF NOT EXISTS idx_events_cycle
+                    ON events(cycle_id);
+
+                    CREATE INDEX IF NOT EXISTS idx_pending_stream
+                    ON pending_images(
+                        camera_side, tube_type, status, id
+                    );
+
                     CREATE INDEX IF NOT EXISTS idx_aborts_status
                     ON abort_requests(status);
                     """
                 )
 
-                # Khong seed row mac dinh: stream per (side, no) duoc
-                # tao lazily khi anh dau tien cua cap (side, no) den.
+                # Migration nhe cho DB cu: bo sung cot moi cho state
+                # machine "nhan anh -> cho ket qua -> moi gan step".
+                self._migrate_columns(
+                    conn,
+                    "streams",
+                    {
+                        "active_event_id": "TEXT",
+                        "active_step": "INTEGER",
+                        "result_wait_since": "REAL",
+                    },
+                )
+                self._migrate_columns(
+                    conn,
+                    "events",
+                    {
+                        "result_status": "TEXT",
+                        "result_error_code": "TEXT",
+                        "processing_error": (
+                            "INTEGER NOT NULL DEFAULT 0"
+                        ),
+                        "result_received_at": "TEXT",
+                    },
+                )
+
+                # Trang thai cu RUNNING duoc chuyen sang state machine moi.
+                # Stream dang cho Step 3 (next_step=3) co the khoi phuc
+                # active_event_id tu event Step 1 gan nhat cua cycle.
+                old_running = conn.execute(
+                    """
+                    SELECT *
+                    FROM streams
+                    WHERE state = 'RUNNING'
+                    """
+                ).fetchall()
+
+                for row in old_running:
+                    next_step = int(row["next_step"] or 1)
+
+                    if next_step == 1:
+                        conn.execute(
+                            """
+                            UPDATE streams
+                            SET
+                                state = 'READY_STEP1',
+                                next_step = 1,
+                                active_event_id = NULL,
+                                active_step = NULL,
+                                result_wait_since = NULL,
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE camera_side = ?
+                            AND tube_type = ?
+                            """,
+                            (row["camera_side"], row["tube_type"]),
+                        )
+                        continue
+
+                    event = conn.execute(
+                        """
+                        SELECT event_id, step
+                        FROM events
+                        WHERE cycle_id = ?
+                        AND camera_side = ?
+                        AND tube_type = ?
+                        AND step = 1
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                        """,
+                        (
+                            row["current_cycle_id"],
+                            row["camera_side"],
+                            row["tube_type"],
+                        ),
+                    ).fetchone()
+
+                    if event is not None:
+                        conn.execute(
+                            """
+                            UPDATE streams
+                            SET
+                                state = 'WAIT_STEP1_RESULT',
+                                next_step = 3,
+                                active_event_id = ?,
+                                active_step = 1,
+                                result_wait_since = ?,
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE camera_side = ?
+                            AND tube_type = ?
+                            """,
+                            (
+                                event["event_id"],
+                                time.time(),
+                                row["camera_side"],
+                                row["tube_type"],
+                            ),
+                        )
+                    else:
+                        conn.execute(
+                            """
+                            UPDATE streams
+                            SET
+                                state = 'READY_STEP3',
+                                next_step = 3,
+                                active_event_id = NULL,
+                                active_step = NULL,
+                                result_wait_since = NULL,
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE camera_side = ?
+                            AND tube_type = ?
+                            """,
+                            (row["camera_side"], row["tube_type"]),
+                        )
 
                 conn.commit()
 
             finally:
                 conn.close()
+
+    @staticmethod
+    def _migrate_columns(
+        conn: sqlite3.Connection,
+        table: str,
+        columns: dict[str, str],
+    ) -> None:
+        """Them cot moi cho DB da ton tai (SQLite ADD COLUMN)."""
+        existing = {
+            row["name"]
+            for row in conn.execute(
+                f"PRAGMA table_info({table})"
+            ).fetchall()
+        }
+
+        for name, ddl in columns.items():
+            if name not in existing:
+                LOGGER.warning(
+                    "Migrating table %s: add column %s",
+                    table,
+                    name,
+                )
+                conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"
+                )
 
     # --------------------------------------------------------
     # META
@@ -373,6 +549,18 @@ class CameraAgentDatabase:
                     """
                     SELECT 1
                     FROM seen_files
+                    WHERE file_path = ?
+                    """,
+                    (file_path,),
+                ).fetchone()
+
+                if row:
+                    return True
+
+                row = conn.execute(
+                    """
+                    SELECT 1
+                    FROM pending_images
                     WHERE file_path = ?
                     """,
                     (file_path,),
@@ -453,6 +641,73 @@ class CameraAgentDatabase:
             finally:
                 conn.close()
 
+    def get_event(self, event_id: str) -> Optional[dict]:
+        with self.lock:
+            conn = self.connect()
+
+            try:
+                row = conn.execute(
+                    """
+                    SELECT *
+                    FROM events
+                    WHERE event_id = ?
+                    """,
+                    (event_id,),
+                ).fetchone()
+
+                return dict(row) if row else None
+
+            finally:
+                conn.close()
+
+    def force_stream_ready(
+        self,
+        camera_side: str,
+        tube_type: str,
+        step: int = 1,
+    ) -> None:
+        """Dua mot stream ve trang thai ranh, khong dung toi hang doi."""
+        step = 3 if int(step) == 3 else 1
+
+        with self.lock:
+            conn = self.connect()
+
+            try:
+                conn.execute(
+                    """
+                    UPDATE streams
+                    SET
+                        next_step = ?,
+                        state = ?,
+                        current_cycle_id = CASE
+                            WHEN ? = 1 THEN NULL
+                            ELSE current_cycle_id
+                        END,
+                        active_event_id = NULL,
+                        active_step = NULL,
+                        result_wait_since = NULL,
+                        last_event_unix = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE camera_side = ?
+                    AND tube_type = ?
+                    """,
+                    (
+                        step,
+                        (
+                            "READY_STEP3"
+                            if step == 3
+                            else "READY_STEP1"
+                        ),
+                        step,
+                        camera_side,
+                        tube_type,
+                    ),
+                )
+                conn.commit()
+
+            finally:
+                conn.close()
+
     def queue_abort(
         self,
         conn: sqlite3.Connection,
@@ -480,24 +735,99 @@ class CameraAgentDatabase:
             ),
         )
 
-    def assign_file_to_sequence(
+    # --------------------------------------------------------
+    # STATE MACHINE: nhan anh -> hang doi -> gan step
+    # --------------------------------------------------------
+    #
+    # Moi stream (camera_side, tube_type) co 4 trang thai:
+    #   READY_STEP1        : ranh, anh ke tiep se la Step 1 cycle moi
+    #   WAIT_STEP1_RESULT  : da upload Step 1, dang cho ket qua AI
+    #   READY_STEP3        : Step 1 PASS, anh ke tiep se la Step 3
+    #   WAIT_STEP3_RESULT  : da upload Step 3, dang cho ket qua AI
+    #
+    # Anh den bat ky luc nao deu duoc luu vao pending_images truoc.
+    # Chi khi stream o READY_* moi lay anh dau tien (FIFO) ra gan step.
+    # Timeout/HTTP 202 KHONG duoc dung de mo khoa stream: chi ket qua AI
+    # da luu DB (callback hoac truy van lai) moi doi duoc trang thai.
+
+    STEP1 = 1
+    STEP3 = 3
+
+    STATE_READY_STEP1 = "READY_STEP1"
+    STATE_WAIT_STEP1_RESULT = "WAIT_STEP1_RESULT"
+    STATE_READY_STEP3 = "READY_STEP3"
+    STATE_WAIT_STEP3_RESULT = "WAIT_STEP3_RESULT"
+    STATE_OUT_OF_SYNC = "OUT_OF_SYNC"
+
+    WAIT_STATES = (STATE_WAIT_STEP1_RESULT, STATE_WAIT_STEP3_RESULT)
+
+    def _ensure_stream_locked(
         self,
-        file_info: CaptureFileInfo,
-        auto_recover_out_of_sync: bool = True,
-    ) -> dict:
+        conn: sqlite3.Connection,
+        camera_side: str,
+        tube_type: str,
+    ) -> sqlite3.Row:
+        stream = conn.execute(
+            """
+            SELECT *
+            FROM streams
+            WHERE camera_side = ?
+            AND tube_type = ?
+            """,
+            (camera_side, tube_type),
+        ).fetchone()
+
+        if stream is not None:
+            return stream
+
+        conn.execute(
+            """
+            INSERT INTO streams (
+                camera_side,
+                tube_type,
+                next_step,
+                cycle_number,
+                current_cycle_id,
+                state,
+                updated_at
+            )
+            VALUES (?, ?, 1, 0, NULL, 'READY_STEP1', CURRENT_TIMESTAMP)
+            """,
+            (camera_side, tube_type),
+        )
+
+        return conn.execute(
+            """
+            SELECT *
+            FROM streams
+            WHERE camera_side = ?
+            AND tube_type = ?
+            """,
+            (camera_side, tube_type),
+        ).fetchone()
+
+    def _make_cycle_id(
+        self,
+        camera_side: str,
+        tube_type: str,
+        cycle_number: int,
+    ) -> str:
+        return (
+            f"{self.agent_id}-"
+            f"{camera_side}-"
+            f"{tube_type}-"
+            f"{cycle_number:09d}"
+        )
+
+    def enqueue_file(self, file_info: CaptureFileInfo) -> dict:
         """
-        Gán file mới vào Step 1 / Step 3 theo stream riêng
-        của từng (camera_side, tube_type). Ảnh của No khác không còn
-        làm gián đoạn chu trình của No hiện tại.
+        Luu anh vao hang doi ben vung, CHUA gan step.
 
-        Chu trình 2 ảnh: ảnh 1 = Step 1, ảnh 2 = Step 3.
-
-        Return:
+        Tra ve:
         {
-            "status": "ASSIGNED" | "BLOCKED" | "ALREADY_SEEN",
-            "event": {...} | None,
-            "abort": {...} | None,
-            "message": "..."
+            "status": "QUEUED" | "ALREADY_SEEN",
+            "pending_id": int | None,
+            "file_info": CaptureFileInfo,
         }
         """
         with self.lock:
@@ -519,6 +849,16 @@ class CameraAgentDatabase:
                     seen = conn.execute(
                         """
                         SELECT 1
+                        FROM pending_images
+                        WHERE file_path = ?
+                        """,
+                        (file_info.path,),
+                    ).fetchone()
+
+                if not seen:
+                    seen = conn.execute(
+                        """
+                        SELECT 1
                         FROM seen_files
                         WHERE file_path = ?
                         """,
@@ -527,258 +867,40 @@ class CameraAgentDatabase:
 
                 if seen:
                     conn.rollback()
-
                     return {
                         "status": "ALREADY_SEEN",
-                        "event": None,
-                        "abort": None,
-                        "message": "File already handled",
+                        "pending_id": None,
+                        "file_info": file_info,
                     }
 
-                stream = conn.execute(
+                cursor = conn.execute(
                     """
-                    SELECT *
-                    FROM streams
-                    WHERE camera_side = ?
-                    AND tube_type = ?
-                    """,
-                    (
-                        file_info.camera_side,
-                        file_info.tube_type,
-                    ),
-                ).fetchone()
-
-                # Stream per (side, no) duoc tao lazily: cap chua tung
-                # co anh -> bat dau bang cycle moi (next_step=1,
-                # cycle_number=0), state RUNNING ngay.
-                if stream is None:
-                    conn.execute(
-                        """
-                        INSERT INTO streams (
-                            camera_side,
-                            tube_type,
-                            next_step,
-                            cycle_number,
-                            current_cycle_id,
-                            state,
-                            updated_at
-                        )
-                        VALUES (?, ?, 1, 0, NULL, 'RUNNING', CURRENT_TIMESTAMP)
-                        """,
-                        (
-                            file_info.camera_side,
-                            file_info.tube_type,
-                        ),
-                    )
-
-                    stream = conn.execute(
-                        """
-                        SELECT *
-                        FROM streams
-                        WHERE camera_side = ?
-                        AND tube_type = ?
-                        """,
-                        (
-                            file_info.camera_side,
-                            file_info.tube_type,
-                        ),
-                    ).fetchone()
-
-                # Khi đang OUT_OF_SYNC, mặc định không được tự suy luận ảnh mới.
-                if stream["state"] != "RUNNING":
-                    if not auto_recover_out_of_sync:
-                        conn.execute(
-                            """
-                            INSERT INTO seen_files (
-                                file_path,
-                                status
-                            )
-                            VALUES (?, 'BLOCKED_OUT_OF_SYNC')
-                            """,
-                            (file_info.path,),
-                        )
-
-                        conn.commit()
-
-                        return {
-                            "status": "BLOCKED",
-                            "event": None,
-                            "abort": None,
-                            "message": (
-                                f"Stream {file_info.camera_side}/"
-                                f"{file_info.tube_type} is OUT_OF_SYNC. "
-                                f"Manual reset required."
-                            ),
-                        }
-
-                    LOGGER.warning(
-                        "Auto-recovered OUT_OF_SYNC side=%s no=%s now at "
-                        "step=1 cycle_number=%s",
-                        file_info.camera_side,
-                        file_info.tube_type,
-                        stream["cycle_number"],
-                    )
-
-                    # Reset stream để ảnh hiện tại được xem là Step 1
-                    # của cycle mới, giữ nguyên cycle_number.
-                    conn.execute(
-                        """
-                        UPDATE streams
-                        SET
-                            next_step = 1,
-                            current_cycle_id = NULL,
-                            state = 'RUNNING',
-                            updated_at = CURRENT_TIMESTAMP
-                        WHERE camera_side = ?
-                        AND tube_type = ?
-                        """,
-                        (
-                            file_info.camera_side,
-                            file_info.tube_type,
-                        ),
-                    )
-
-                    stream = conn.execute(
-                        """
-                        SELECT *
-                        FROM streams
-                        WHERE camera_side = ?
-                        AND tube_type = ?
-                        """,
-                        (
-                            file_info.camera_side,
-                            file_info.tube_type,
-                        ),
-                    ).fetchone()
-
-                    if stream is None:
-                        raise RuntimeError(
-                            f"Stream not found: "
-                            f"{file_info.camera_side}/{file_info.tube_type}"
-                        )
-
-                next_step = int(stream["next_step"])
-                current_cycle_id = stream["current_cycle_id"]
-                cycle_number = int(stream["cycle_number"])
-
-                # Step 1 luôn bắt đầu cycle mới. Counter cycle tăng độc lập theo
-                # (camera_side, tube_type); tube_type nằm trong cycle_id
-                # để không trùng giữa các No trên cùng side.
-                if next_step == 1:
-                    cycle_number += 1
-
-                    cycle_id = (
-                        f"{self.agent_id}-"
-                        f"{file_info.camera_side}-"
-                        f"{file_info.tube_type}-"
-                        f"{cycle_number:09d}"
-                    )
-
-                    assigned_step = 1
-
-                else:
-                    cycle_id = current_cycle_id
-                    assigned_step = next_step
-
-                if not cycle_id:
-                    raise RuntimeError(
-                        "Invalid sequence state: current cycle_id is empty"
-                    )
-
-                event_id = f"{cycle_id}-S{assigned_step}"
-
-                # Moi event deu la Step 1 / Step 3 -> luon upload.
-                upload_status = "PENDING_UPLOAD"
-
-                conn.execute(
-                    """
-                    INSERT INTO events (
-                        event_id,
-                        cycle_id,
+                    INSERT INTO pending_images (
                         file_path,
                         file_name,
                         camera_side,
                         tube_type,
-                        step,
-                        capture_timestamp,
-                        upload_status
+                        observed_at,
+                        status
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, 'QUEUED')
                     """,
                     (
-                        event_id,
-                        cycle_id,
                         file_info.path,
-
-                        # Chỉ lưu thông tin audit, không parse, không dùng logic.
                         Path(file_info.path).name,
-
                         file_info.camera_side,
                         file_info.tube_type,
-                        assigned_step,
-
-                        # Cột cũ capture_timestamp,
-                        # nhưng lưu observed_at do Agent tạo.
                         file_info.observed_at,
-
-                        upload_status,
                     ),
                 )
 
-                if assigned_step == 1:
-                    # Chu trinh 2 anh: sau Step 1 la Step 3.
-                    new_next_step = 3
-                    new_current_cycle_id = cycle_id
-
-                else:
-                    # Step 3 hoàn tất cycle.
-                    new_next_step = 1
-                    new_current_cycle_id = None
-
-                conn.execute(
-                    """
-                    UPDATE streams
-                    SET
-                        next_step = ?,
-                        cycle_number = ?,
-                        current_cycle_id = ?,
-                        state = 'RUNNING',
-                        last_event_unix = ?,
-                        last_file_path = ?,
-                        last_capture_timestamp = ?,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE camera_side = ?
-                    AND tube_type = ?
-                    """,
-                    (
-                        new_next_step,
-                        cycle_number,
-                        new_current_cycle_id,
-                        time.time(),
-                        file_info.path,
-                        file_info.observed_at,
-                        file_info.camera_side,
-                        file_info.tube_type,
-                    ),
-                )
-
+                pending_id = cursor.lastrowid
                 conn.commit()
 
                 return {
-                    "status": "ASSIGNED",
-                    "event": {
-                        "event_id": event_id,
-                        "cycle_id": cycle_id,
-                        "file_path": file_info.path,
-                        "file_name": Path(file_info.path).name,
-                        "camera_side": file_info.camera_side,
-                        "tube_type": file_info.tube_type,
-                        "step": assigned_step,
-                        "capture_timestamp": file_info.observed_at,
-                        "upload_status": upload_status,
-                    },
-                    "abort": None,
-                    "message": "File assigned to sequence",
+                    "status": "QUEUED",
+                    "pending_id": pending_id,
+                    "file_info": file_info,
                 }
 
             except Exception:
@@ -788,13 +910,568 @@ class CameraAgentDatabase:
             finally:
                 conn.close()
 
+    def _dispatch_next_locked(
+        self,
+        conn: sqlite3.Connection,
+        camera_side: str,
+        tube_type: str,
+        auto_recover_out_of_sync: bool = True,
+    ) -> Optional[dict]:
+        """
+        Lay anh dau tien trong hang doi cua stream va gan step, neu
+        stream dang ranh. Ham nay PHAI duoc goi trong transaction cua
+        caller (conn da BEGIN IMMEDIATE).
+        """
+        stream = self._ensure_stream_locked(
+            conn, camera_side, tube_type
+        )
+
+        state = str(stream["state"] or self.STATE_OUT_OF_SYNC)
+
+        if state in self.WAIT_STATES:
+            # Dang cho ket qua AI cua anh truoc -> giu nguyen hang doi.
+            return None
+
+        if state == self.STATE_OUT_OF_SYNC:
+            if not auto_recover_out_of_sync:
+                return None
+
+            LOGGER.warning(
+                "Auto-recover OUT_OF_SYNC side=%s no=%s -> READY_STEP1",
+                camera_side,
+                tube_type,
+            )
+
+            conn.execute(
+                """
+                UPDATE streams
+                SET
+                    state = 'READY_STEP1',
+                    next_step = 1,
+                    current_cycle_id = NULL,
+                    active_event_id = NULL,
+                    active_step = NULL,
+                    result_wait_since = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE camera_side = ?
+                AND tube_type = ?
+                """,
+                (camera_side, tube_type),
+            )
+            state = self.STATE_READY_STEP1
+
+        # Tuong thich DB cu (state RUNNING).
+        if state == "RUNNING":
+            state = (
+                self.STATE_READY_STEP3
+                if int(stream["next_step"] or 1) == 3
+                and stream["current_cycle_id"]
+                else self.STATE_READY_STEP1
+            )
+            conn.execute(
+                """
+                UPDATE streams
+                SET state = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE camera_side = ?
+                AND tube_type = ?
+                """,
+                (state, camera_side, tube_type),
+            )
+
+        if state not in (
+            self.STATE_READY_STEP1,
+            self.STATE_READY_STEP3,
+        ):
+            LOGGER.error(
+                "Unknown stream state side=%s no=%s state=%s -> "
+                "reset READY_STEP1",
+                camera_side,
+                tube_type,
+                state,
+            )
+            conn.execute(
+                """
+                UPDATE streams
+                SET
+                    state = 'READY_STEP1',
+                    next_step = 1,
+                    current_cycle_id = NULL,
+                    active_event_id = NULL,
+                    active_step = NULL,
+                    result_wait_since = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE camera_side = ?
+                AND tube_type = ?
+                """,
+                (camera_side, tube_type),
+            )
+            state = self.STATE_READY_STEP1
+
+        pending = conn.execute(
+            """
+            SELECT *
+            FROM pending_images
+            WHERE camera_side = ?
+            AND tube_type = ?
+            AND status = 'QUEUED'
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (camera_side, tube_type),
+        ).fetchone()
+
+        if pending is None:
+            return None
+
+        cycle_number = int(stream["cycle_number"] or 0)
+
+        if state == self.STATE_READY_STEP1:
+            assigned_step = self.STEP1
+            cycle_number += 1
+            cycle_id = self._make_cycle_id(
+                camera_side, tube_type, cycle_number
+            )
+            new_state = self.STATE_WAIT_STEP1_RESULT
+            new_next_step = 3
+
+        else:
+            assigned_step = self.STEP3
+            cycle_id = stream["current_cycle_id"]
+
+            if not cycle_id:
+                LOGGER.error(
+                    "READY_STEP3 without current_cycle_id side=%s "
+                    "no=%s -> reset READY_STEP1",
+                    camera_side,
+                    tube_type,
+                )
+                conn.execute(
+                    """
+                    UPDATE streams
+                    SET
+                        state = 'READY_STEP1',
+                        next_step = 1,
+                        current_cycle_id = NULL,
+                        active_event_id = NULL,
+                        active_step = NULL,
+                        result_wait_since = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE camera_side = ?
+                    AND tube_type = ?
+                    """,
+                    (camera_side, tube_type),
+                )
+                return None
+
+            new_state = self.STATE_WAIT_STEP3_RESULT
+            new_next_step = 1
+
+        event_id = f"{cycle_id}-S{assigned_step}"
+
+        conn.execute(
+            """
+            INSERT INTO events (
+                event_id,
+                cycle_id,
+                file_path,
+                file_name,
+                camera_side,
+                tube_type,
+                step,
+                capture_timestamp,
+                upload_status
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_UPLOAD')
+            """,
+            (
+                event_id,
+                cycle_id,
+                pending["file_path"],
+                pending["file_name"],
+                camera_side,
+                tube_type,
+                assigned_step,
+                pending["observed_at"],
+            ),
+        )
+
+        conn.execute(
+            """
+            UPDATE pending_images
+            SET
+                status = 'ASSIGNED',
+                event_id = ?,
+                assigned_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (event_id, pending["id"]),
+        )
+
+        conn.execute(
+            """
+            UPDATE streams
+            SET
+                next_step = ?,
+                cycle_number = ?,
+                current_cycle_id = ?,
+                state = ?,
+                active_event_id = ?,
+                active_step = ?,
+                result_wait_since = ?,
+                last_event_unix = ?,
+                last_file_path = ?,
+                last_capture_timestamp = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE camera_side = ?
+            AND tube_type = ?
+            """,
+            (
+                new_next_step,
+                cycle_number,
+                cycle_id,
+                new_state,
+                event_id,
+                assigned_step,
+                time.time(),
+                time.time(),
+                pending["file_path"],
+                pending["observed_at"],
+                camera_side,
+                tube_type,
+            ),
+        )
+
+        return {
+            "event_id": event_id,
+            "cycle_id": cycle_id,
+            "file_path": pending["file_path"],
+            "file_name": pending["file_name"],
+            "camera_side": camera_side,
+            "tube_type": tube_type,
+            "step": assigned_step,
+            "capture_timestamp": pending["observed_at"],
+            "upload_status": "PENDING_UPLOAD",
+        }
+
+    def dispatch_pending(
+        self,
+        camera_side: str,
+        tube_type: str,
+        auto_recover_out_of_sync: bool = True,
+    ) -> Optional[dict]:
+        """Gan anh ke tiep cua mot stream neu stream dang ranh."""
+        with self.lock:
+            conn = self.connect()
+
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+
+                event = self._dispatch_next_locked(
+                    conn,
+                    camera_side,
+                    tube_type,
+                    auto_recover_out_of_sync=auto_recover_out_of_sync,
+                )
+
+                conn.commit()
+                return event
+
+            except Exception:
+                conn.rollback()
+                raise
+
+            finally:
+                conn.close()
+
+    def dispatch_all_pending(
+        self,
+        auto_recover_out_of_sync: bool = True,
+    ) -> list[dict]:
+        """Xu ly hang doi cua tat ca stream (dung khi startup/reset)."""
+        assigned = []
+
+        with self.lock:
+            conn = self.connect()
+
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+
+                rows = conn.execute(
+                    """
+                    SELECT DISTINCT camera_side, tube_type
+                    FROM pending_images
+                    WHERE status = 'QUEUED'
+                    ORDER BY id ASC
+                    """
+                ).fetchall()
+
+                for row in rows:
+                    event = self._dispatch_next_locked(
+                        conn,
+                        row["camera_side"],
+                        row["tube_type"],
+                        auto_recover_out_of_sync=(
+                            auto_recover_out_of_sync
+                        ),
+                    )
+
+                    if event is not None:
+                        assigned.append(event)
+
+                conn.commit()
+                return assigned
+
+            except Exception:
+                conn.rollback()
+                raise
+
+            finally:
+                conn.close()
+
+    def assign_file_to_sequence(
+        self,
+        file_info: CaptureFileInfo,
+        auto_recover_out_of_sync: bool = True,
+    ) -> dict:
+        """
+        API tuong thich: nhan anh (enqueue) + thu gan step ngay neu
+        stream dang ranh.
+
+        Khac ban cu: neu stream dang cho ket qua AI, anh chi nam trong
+        hang doi va tra ve status="QUEUED" (KHONG bi gan Step 3 som).
+        """
+        enqueue = self.enqueue_file(file_info)
+
+        if enqueue["status"] == "ALREADY_SEEN":
+            return {
+                "status": "ALREADY_SEEN",
+                "event": None,
+                "abort": None,
+                "message": "File already handled",
+            }
+
+        event = self.dispatch_pending(
+            file_info.camera_side,
+            file_info.tube_type,
+            auto_recover_out_of_sync=auto_recover_out_of_sync,
+        )
+
+        if event is None:
+            return {
+                "status": "QUEUED",
+                "event": None,
+                "abort": None,
+                "message": (
+                    "File queued: stream is waiting for AI result "
+                    "or is OUT_OF_SYNC"
+                ),
+            }
+
+        return {
+            "status": "ASSIGNED",
+            "event": event,
+            "abort": None,
+            "message": "File assigned to sequence",
+        }
+
+    def complete_active_event(
+        self,
+        event_id: str,
+        result_status: str,
+        error_code: str = "",
+        processing_error: bool = False,
+    ) -> dict:
+        """
+        Ap dung ket qua AI cho dung event dang active cua stream, roi
+        gan anh ke tiep trong hang doi (neu co) trong CUNG transaction.
+
+        Idempotent: callback trung hoac den muon khong doi state lan nua.
+        """
+        result_status = str(result_status or "").upper()
+
+        with self.lock:
+            conn = self.connect()
+
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+
+                event = conn.execute(
+                    """
+                    SELECT *
+                    FROM events
+                    WHERE event_id = ?
+                    """,
+                    (event_id,),
+                ).fetchone()
+
+                if event is None:
+                    conn.rollback()
+                    return {
+                        "action": "NOT_FOUND",
+                        "event_id": event_id,
+                        "next_event": None,
+                    }
+
+                step = int(event["step"])
+                allowed = ("PASS", "FAIL") if step == 1 else ("OK", "NG")
+
+                if result_status not in allowed:
+                    conn.rollback()
+                    return {
+                        "action": "INVALID_STATUS",
+                        "event_id": event_id,
+                        "step": step,
+                        "result_status": result_status,
+                        "next_event": None,
+                    }
+
+                if event["result_status"] is not None:
+                    conn.rollback()
+                    return {
+                        "action": "DUPLICATE",
+                        "event_id": event_id,
+                        "result_status": event["result_status"],
+                        "next_event": None,
+                    }
+
+                # Luu ket qua vao event trong moi truong hop (ke ca
+                # callback den muon) de giu lich su day du.
+                conn.execute(
+                    """
+                    UPDATE events
+                    SET
+                        result_status = ?,
+                        result_error_code = ?,
+                        processing_error = ?,
+                        result_received_at = CURRENT_TIMESTAMP
+                    WHERE event_id = ?
+                    AND result_status IS NULL
+                    """,
+                    (
+                        result_status,
+                        error_code,
+                        1 if processing_error else 0,
+                        event_id,
+                    ),
+                )
+
+                stream = conn.execute(
+                    """
+                    SELECT *
+                    FROM streams
+                    WHERE camera_side = ?
+                    AND tube_type = ?
+                    """,
+                    (event["camera_side"], event["tube_type"]),
+                ).fetchone()
+
+                if (
+                    stream is None
+                    or stream["active_event_id"] != event_id
+                ):
+                    conn.commit()
+                    return {
+                        "action": "IGNORED_STALE",
+                        "event_id": event_id,
+                        "result_status": result_status,
+                        "next_event": None,
+                    }
+
+                if step == self.STEP1 and result_status == "PASS":
+                    new_state = self.STATE_READY_STEP3
+                    new_next_step = 3
+                    keep_cycle_id = event["cycle_id"]
+                else:
+                    # Step 1 FAIL hoac Step 3 OK/NG: dong cycle.
+                    new_state = self.STATE_READY_STEP1
+                    new_next_step = 1
+                    keep_cycle_id = None
+
+                conn.execute(
+                    """
+                    UPDATE streams
+                    SET
+                        state = ?,
+                        next_step = ?,
+                        current_cycle_id = ?,
+                        active_event_id = NULL,
+                        active_step = NULL,
+                        result_wait_since = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE camera_side = ?
+                    AND tube_type = ?
+                    """,
+                    (
+                        new_state,
+                        new_next_step,
+                        keep_cycle_id,
+                        event["camera_side"],
+                        event["tube_type"],
+                    ),
+                )
+
+                next_event = self._dispatch_next_locked(
+                    conn,
+                    event["camera_side"],
+                    event["tube_type"],
+                )
+
+                conn.commit()
+
+                return {
+                    "action": "APPLIED",
+                    "event_id": event_id,
+                    "step": step,
+                    "result_status": result_status,
+                    "stream_state": new_state,
+                    "next_event": next_event,
+                }
+
+            except Exception:
+                conn.rollback()
+                raise
+
+            finally:
+                conn.close()
+
+    def get_active_events_awaiting_result(self) -> list[dict]:
+        """Cac event dang active nhung chua co ket qua AI (de poll lai)."""
+        with self.lock:
+            conn = self.connect()
+
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        e.*,
+                        s.state AS stream_state,
+                        s.result_wait_since AS result_wait_since
+                    FROM streams s
+                    JOIN events e ON e.event_id = s.active_event_id
+                    WHERE s.state IN (
+                        'WAIT_STEP1_RESULT',
+                        'WAIT_STEP3_RESULT'
+                    )
+                    AND e.result_status IS NULL
+                    ORDER BY s.result_wait_since ASC
+                    """
+                ).fetchall()
+
+                return [dict(row) for row in rows]
+
+            finally:
+                conn.close()
+
     def warn_incomplete_streams(
         self,
         warn_sec: float,
     ) -> list[dict]:
         """
-        Chỉ cảnh báo (không thay đổi trạng thái) các stream
-        đang chờ Step 3 quá thời gian cho phép.
+        Chỉ cảnh báo (không thay đổi trạng thái) các stream đang chờ
+        ảnh/kết quả quá thời gian cho phép.
+
+        Lưu ý: WAIT_* chỉ cảnh báo, KHÔNG bị coi là STEP 1 FAIL. Ảnh kế
+        tiếp vẫn nằm trong hàng đợi và được retry kết quả.
         """
         warning_streams = []
         deadline = time.time() - warn_sec
@@ -807,10 +1484,19 @@ class CameraAgentDatabase:
                     """
                     SELECT *
                     FROM streams
-                    WHERE state = 'RUNNING'
-                    AND next_step = 3
-                    AND last_event_unix IS NOT NULL
-                    AND last_event_unix < ?
+                    WHERE state IN (
+                        'READY_STEP3',
+                        'WAIT_STEP1_RESULT',
+                        'WAIT_STEP3_RESULT'
+                    )
+                    AND COALESCE(
+                        result_wait_since,
+                        last_event_unix
+                    ) IS NOT NULL
+                    AND COALESCE(
+                        result_wait_since,
+                        last_event_unix
+                    ) < ?
                     """,
                     (deadline,),
                 ).fetchall()
@@ -831,10 +1517,13 @@ class CameraAgentDatabase:
         timeout_sec: float,
     ) -> list[dict]:
         """
-        Nếu đang chờ Step 3 quá lâu:
-        - Cycle cũ bị abort.
-        - Stream chuyển sang OUT_OF_SYNC.
-        - Kỹ thuật viên cần reset thủ công.
+        Nếu đã Step 1 PASS nhưng quá lâu không có ảnh Step 3:
+        - Cycle cũ bị abort E204.
+        - Stream chuyển sang OUT_OF_SYNC (kỹ thuật viên reset thủ công).
+
+        WAIT_STEP1_RESULT / WAIT_STEP3_RESULT KHÔNG bị timeout ở đây:
+        mất mạng/không nhận được callback không được hiểu là STEP 1 FAIL.
+        Hệ thống tiếp tục retry và cảnh báo cho đến khi có kết quả.
         """
         aborts = []
         deadline = time.time() - timeout_sec
@@ -849,10 +1538,21 @@ class CameraAgentDatabase:
                     """
                     SELECT *
                     FROM streams
-                    WHERE state = 'RUNNING'
-                    AND next_step = 3
-                    AND last_event_unix IS NOT NULL
-                    AND last_event_unix < ?
+                    WHERE (
+                        state = 'READY_STEP3'
+                        OR (
+                            state = 'RUNNING'
+                            AND next_step = 3
+                        )
+                    )
+                    AND COALESCE(
+                        result_wait_since,
+                        last_event_unix
+                    ) IS NOT NULL
+                    AND COALESCE(
+                        result_wait_since,
+                        last_event_unix
+                    ) < ?
                     """,
                     (deadline,),
                 ).fetchall()
@@ -889,6 +1589,9 @@ class CameraAgentDatabase:
                             next_step = 1,
                             current_cycle_id = NULL,
                             state = 'OUT_OF_SYNC',
+                            active_event_id = NULL,
+                            active_step = NULL,
+                            result_wait_since = NULL,
                             updated_at = CURRENT_TIMESTAMP
                         WHERE camera_side = ?
                         AND tube_type = ?
@@ -935,7 +1638,7 @@ class CameraAgentDatabase:
                 for stream in streams:
                     if (
                         stream["current_cycle_id"]
-                        and int(stream["next_step"]) != 1
+                        and stream["state"] != "READY_STEP1"
                     ):
                         error_code = "E601_MANUAL_SEQUENCE_RESET"
 
@@ -962,7 +1665,10 @@ class CameraAgentDatabase:
                     SET
                         next_step = 1,
                         current_cycle_id = NULL,
-                        state = 'RUNNING',
+                        state = 'READY_STEP1',
+                        active_event_id = NULL,
+                        active_step = NULL,
+                        result_wait_since = NULL,
                         last_event_unix = NULL,
                         last_file_path = NULL,
                         last_capture_timestamp = NULL,
@@ -1023,7 +1729,10 @@ class CameraAgentDatabase:
                     SET
                         next_step = 1,
                         current_cycle_id = NULL,
-                        state = 'RUNNING',
+                        state = 'READY_STEP1',
+                        active_event_id = NULL,
+                        active_step = NULL,
+                        result_wait_since = NULL,
                         last_event_unix = NULL,
                         last_file_path = NULL,
                         last_capture_timestamp = NULL,
@@ -1041,24 +1750,6 @@ class CameraAgentDatabase:
                 conn.rollback()
                 raise
 
-            finally:
-                conn.close()
-
-    def cancel_cycle_events(self, cycle_id: str) -> int:
-        with self.lock:
-            conn = self.connect()
-            try:
-                cursor = conn.execute(
-                    """
-                    UPDATE events
-                    SET upload_status = 'CANCELLED'
-                    WHERE cycle_id = ?
-                    AND upload_status IN ('PENDING_UPLOAD', 'RETRY')
-                    """,
-                    (cycle_id,),
-                )
-                conn.commit()
-                return cursor.rowcount
             finally:
                 conn.close()
 
@@ -1214,9 +1905,30 @@ class CameraAgentDatabase:
                     """
                 ).fetchone()["count"]
 
+                queued_count = conn.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM pending_images
+                    WHERE status = 'QUEUED'
+                    """
+                ).fetchone()["count"]
+
+                waiting_count = conn.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM streams
+                    WHERE state IN (
+                        'WAIT_STEP1_RESULT',
+                        'WAIT_STEP3_RESULT'
+                    )
+                    """
+                ).fetchone()["count"]
+
                 return {
                     "pending_uploads": upload_count,
                     "pending_aborts": abort_count,
+                    "queued_images": queued_count,
+                    "streams_waiting_result": waiting_count,
                 }
 
             finally:
@@ -1967,6 +2679,7 @@ class CameraAgent:
         self.timeout_thread: Optional[threading.Thread] = None
 
         self.http_session = requests.Session()
+        self._recovery_warnings: dict[str, float] = {}
 
     # --------------------------------------------------------
     # NETWORK SHARE
@@ -2104,7 +2817,7 @@ class CameraAgent:
         self.ensure_root_path()
 
         self.bootstrap_start_from_now()
-        self.auto_reset_streams()
+        self.recover_after_restart()
 
         if self.use_smart_poller:
             # Share lon (network_share / UNC): dung
@@ -2314,26 +3027,95 @@ class CameraAgent:
 
         LOGGER.warning(
             "Bootstrap completed. Existing files=%s were ignored. "
-            "Both L/R streams will be auto-reset on startup.",
+            "Streams will be recovered from DB queue/state.",
             len(all_files),
         )
 
+    def recover_after_restart(self) -> None:
+        """
+        Khoi phuc hang doi va anh dang cho ket qua sau khi agent restart.
+
+        - WAIT_* + active event con ton tai: giu nguyen de callback/
+          truy van lai ket qua tiep tuc xu ly (khong reset, khong mat anh).
+        - WAIT_* nhung event khong con: dua stream ve READY_STEP1.
+        - OUT_OF_SYNC: chi auto-recover khi cau hinh cho phep.
+        - Sau do gan anh dau tien trong hang doi cho moi stream ranh.
+        """
+        streams = self.database.get_streams()
+
+        for stream in streams:
+            side = stream["camera_side"]
+            tube_type = stream["tube_type"]
+            state = stream["state"]
+
+            if state in (
+                CameraAgentDatabase.STATE_WAIT_STEP1_RESULT,
+                CameraAgentDatabase.STATE_WAIT_STEP3_RESULT,
+            ):
+                event_id = stream.get("active_event_id")
+                event = (
+                    self.database.get_event(event_id)
+                    if event_id
+                    else None
+                )
+
+                if event is None:
+                    LOGGER.warning(
+                        "Restart recovery: active event missing -> "
+                        "READY_STEP1 side=%s no=%s event=%s",
+                        side,
+                        tube_type,
+                        event_id,
+                    )
+                    self.database.force_stream_ready(
+                        side, tube_type, step=1
+                    )
+                else:
+                    LOGGER.warning(
+                        "Restart recovery: keep waiting result "
+                        "side=%s no=%s event=%s state=%s",
+                        side,
+                        tube_type,
+                        event_id,
+                        state,
+                    )
+                continue
+
+            if state == CameraAgentDatabase.STATE_OUT_OF_SYNC:
+                if self.auto_recover_out_of_sync:
+                    LOGGER.warning(
+                        "Restart recovery: auto-recover OUT_OF_SYNC "
+                        "side=%s no=%s",
+                        side,
+                        tube_type,
+                    )
+                    self.database.force_stream_ready(
+                        side, tube_type, step=1
+                    )
+                else:
+                    LOGGER.warning(
+                        "Restart recovery: keep OUT_OF_SYNC (manual "
+                        "reset required) side=%s no=%s",
+                        side,
+                        tube_type,
+                    )
+
+        assigned = self.database.dispatch_all_pending(
+            auto_recover_out_of_sync=self.auto_recover_out_of_sync
+        )
+
+        for event in assigned:
+            LOGGER.warning(
+                "Restart recovery: assigned queued image "
+                "event=%s cycle=%s step=%s",
+                event["event_id"],
+                event["cycle_id"],
+                event["step"],
+            )
+
     def auto_reset_streams(self) -> None:
-        for side in ("L", "R"):
-            aborts = self.database.reset_stream(side)
-
-            for abort in aborts:
-                LOGGER.warning(
-                    "Auto-reset on startup side=%s aborted_cycle=%s",
-                    side,
-                    abort,
-                )
-
-            if not aborts:
-                LOGGER.info(
-                    "Auto-reset on startup side=%s (no active cycle)",
-                    side,
-                )
+        """Tuong thich API cu: gio la recover_after_restart()."""
+        self.recover_after_restart()
 
     # --------------------------------------------------------
     # FILE CANDIDATE MANAGEMENT
@@ -2468,6 +3250,13 @@ class CameraAgent:
 
                 return
 
+            if result["status"] == "QUEUED":
+                LOGGER.info(
+                    "Image queued (stream waiting) path=%s",
+                    path,
+                )
+                return
+
             event = result["event"]
 
             if result.get("abort"):
@@ -2587,6 +3376,7 @@ class CameraAgent:
             try:
                 self.upload_pending_aborts()
                 self.upload_pending_images()
+                self.recover_pending_results()
 
             except Exception:
                 LOGGER.exception("Upload loop error")
@@ -2700,6 +3490,114 @@ class CameraAgent:
                 ex,
             )
 
+    def recover_pending_results(self) -> None:
+        """
+        Truy van lai ket qua AI da luu DB neu callback bi mat.
+
+        Chi ap dung cho event dang active cua stream. HTTP 202 luc upload
+        KHONG duoc dung de mo khoa: chi status PASS/FAIL/OK/NG tra ve tu
+        AI Server moi doi state.
+        """
+        events = self.database.get_active_events_awaiting_result()
+
+        for event in events:
+            if self.stop_event.is_set():
+                return
+
+            event_id = event["event_id"]
+            url = (
+                f"{self.ai_base_url}/api/v1/events/"
+                f"{event_id}/result"
+            )
+
+            try:
+                response = self.http_session.get(
+                    url,
+                    timeout=self.upload_timeout_sec,
+                )
+
+                if response.status_code == 404:
+                    # AI Server chua nhan duoc anh (dang retry upload)
+                    # hoac phien ban cu chua co endpoint. Khong coi la
+                    # STEP 1 FAIL.
+                    self._warn_recovery(
+                        event_id,
+                        "result endpoint HTTP=404 (still waiting)",
+                    )
+                    continue
+
+                if response.status_code != 200:
+                    self._warn_recovery(
+                        event_id,
+                        f"result HTTP={response.status_code}",
+                    )
+                    continue
+
+                body = response.json()
+
+                if not body.get("found"):
+                    self._warn_recovery(
+                        event_id,
+                        "AI Server does not know event yet",
+                    )
+                    continue
+
+                status = body.get("status")
+                error_code = body.get("error_code") or ""
+
+                if not status:
+                    # Dang xu ly: giu nguyen WAIT_* va tiep tuc poll.
+                    continue
+
+                result = self.database.complete_active_event(
+                    event_id=event_id,
+                    result_status=status,
+                    error_code=error_code,
+                    processing_error=bool(
+                        body.get("processing_error")
+                    ),
+                )
+
+                LOGGER.warning(
+                    "Recovered AI result by polling event=%s status=%s "
+                    "error=%s action=%s",
+                    event_id,
+                    status,
+                    error_code,
+                    result["action"],
+                )
+
+                if result.get("next_event"):
+                    next_event = result["next_event"]
+                    LOGGER.info(
+                        "Recovered result unlocked next image "
+                        "event=%s cycle=%s step=%s",
+                        next_event["event_id"],
+                        next_event["cycle_id"],
+                        next_event["step"],
+                    )
+
+            except Exception as ex:
+                self._warn_recovery(
+                    event_id,
+                    f"result poll failed: {ex}",
+                )
+
+    def _warn_recovery(self, event_id: str, message: str) -> None:
+        """Cảnh báo có throttle để không spam log mỗi 2 giây."""
+        now = time.time()
+        last = self._recovery_warnings.get(event_id, 0.0)
+
+        if now - last < 60.0:
+            return
+
+        self._recovery_warnings[event_id] = now
+        LOGGER.warning(
+            "Waiting AI result event=%s: %s (retry, NOT Step 1 FAIL)",
+            event_id,
+            message,
+        )
+
     def upload_pending_aborts(self) -> None:
         aborts = self.database.get_pending_aborts()
 
@@ -2770,39 +3668,115 @@ class CameraAgent:
     def reset_sequence(self, camera_side: str) -> dict:
         aborts = self.database.reset_stream(camera_side)
 
+        # Anh da nhan nhung chua gan step van duoc giu lai; sau reset
+        # (neu co) chung duoc gan lai thanh Step 1 cua cycle moi.
+        assigned = self.database.dispatch_all_pending(
+            auto_recover_out_of_sync=self.auto_recover_out_of_sync
+        )
+
         LOGGER.warning(
-            "Manual sequence reset side=%s aborted_cycles=%s",
+            "Manual sequence reset side=%s aborted_cycles=%s "
+            "queued_assigned=%s",
             camera_side,
             aborts,
+            len(assigned),
         )
 
         return {
             "camera_side": camera_side,
             "reset": True,
             "aborted_cycles": aborts,
+            "assigned_after_reset": assigned,
             "message": (
                 "Sequence reset complete. "
-                "The next new image will be treated as Step 1."
+                "Queued/new images are treated as Step 1."
             ),
         }
 
-    def handle_step1_fail(self, cycle_id: str, camera_side: str, error_code: str) -> None:
-        # 1. Cancel pending events (S2/S3) of the failed cycle
-        self.database.cancel_cycle_events(cycle_id)
-
-        # 2. Reset stream only if this cycle is still the active one
-        stream = self.database.reset_stream_if_cycle(
-            camera_side,
-            cycle_id,
+    def apply_inspection_result(
+        self,
+        event_id: str,
+        result_status: str,
+        error_code: str = "",
+        processing_error: bool = False,
+    ) -> dict:
+        """Ap dung ket qua AI (callback hoac poll lai) mot cach idempotent."""
+        result = self.database.complete_active_event(
+            event_id=event_id,
+            result_status=result_status,
+            error_code=error_code,
+            processing_error=processing_error,
         )
 
-        LOGGER.warning(
-            "Step 1 FAIL handled cycle=%s error=%s side=%s events_cancelled=%s stream_reset=%s",
-            cycle_id,
-            error_code,
-            camera_side,
-            True,
-            stream is not None,
+        action = result.get("action")
+
+        if action == "APPLIED":
+            LOGGER.info(
+                "AI result applied event=%s status=%s error=%s "
+                "stream_state=%s",
+                event_id,
+                result_status,
+                error_code,
+                result.get("stream_state"),
+            )
+        else:
+            LOGGER.warning(
+                "AI result NOT applied event=%s status=%s action=%s",
+                event_id,
+                result_status,
+                action,
+            )
+
+        next_event = result.get("next_event")
+
+        if next_event:
+            LOGGER.info(
+                "Next queued image assigned after result event=%s "
+                "cycle=%s step=%s",
+                next_event["event_id"],
+                next_event["cycle_id"],
+                next_event["step"],
+            )
+
+        return result
+
+    def handle_step1_fail(
+        self,
+        cycle_id: str,
+        camera_side: str,
+        error_code: str,
+    ) -> None:
+        """
+        Tuong thich webhook cu. Khong con cancel event/anh nao.
+
+        Chi dong cycle dang active cua stream tuong ung (neu con) de anh
+        ke tiep trong hang doi duoc xu ly nhu Step 1 cua cycle moi.
+        """
+        target_stream = None
+
+        for stream in self.database.get_streams():
+            if (
+                stream["camera_side"] == camera_side
+                and stream["current_cycle_id"] == cycle_id
+            ):
+                target_stream = stream
+                break
+
+        if (
+            target_stream is None
+            or not target_stream.get("active_event_id")
+        ):
+            LOGGER.warning(
+                "Step 1 FAIL ignored (cycle not active) cycle=%s side=%s",
+                cycle_id,
+                camera_side,
+            )
+            return
+
+        self.apply_inspection_result(
+            event_id=target_stream["active_event_id"],
+            result_status="FAIL",
+            error_code=error_code,
         )
 
     def get_health(self) -> dict:
@@ -2907,25 +3881,51 @@ def inspection_result(payload: dict):
             detail="Camera Agent is not started",
         )
 
-    cycle_id = payload.get("cycle_id")
+    event_id = payload.get("event_id")
     step = payload.get("step")
-    passed = payload.get("passed", True)
-    camera_side = payload.get("camera_side")
-    error_code = payload.get("error_code", "")
+    error_code = payload.get("error_code") or ""
+    processing_error = bool(payload.get("processing_error", False))
 
-    if step != 1:
-        return {"accepted": True, "action": "ignored_not_step1"}
+    if not event_id:
+        return {"accepted": False, "action": "missing_event_id"}
 
-    if passed:
-        return {"accepted": True, "action": "ignored_passed"}
+    try:
+        step = int(step)
+    except (TypeError, ValueError):
+        return {"accepted": False, "action": "invalid_step"}
 
-    camera_agent.handle_step1_fail(
-        cycle_id=cycle_id,
-        camera_side=camera_side,
-        error_code=error_code,
+    status = payload.get("status")
+
+    if status is None:
+        passed = payload.get("passed", True)
+
+        if step == 1:
+            status = "PASS" if passed else "FAIL"
+        elif step == 3:
+            status = "OK" if passed else "NG"
+        else:
+            return {"accepted": False, "action": "invalid_step"}
+
+    status = str(status).upper()
+
+    allowed = ("PASS", "FAIL") if step == 1 else ("OK", "NG")
+
+    if step not in (1, 3) or status not in allowed:
+        return {
+            "accepted": False,
+            "action": "invalid_step_or_status",
+            "step": step,
+            "status": status,
+        }
+
+    result = camera_agent.apply_inspection_result(
+        event_id=str(event_id),
+        result_status=status,
+        error_code=str(error_code),
+        processing_error=processing_error,
     )
 
-    return {"accepted": True, "action": "cycle_aborted_stream_reset"}
+    return {"accepted": True, **result}
 
 
 # ============================================================
