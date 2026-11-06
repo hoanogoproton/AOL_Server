@@ -71,13 +71,27 @@ sequence:
 
 serial:
   enabled: true
-  port: "COM9"
+  port: "COM12"
   baudrate: 9600
   retry_count: 3
   retry_interval_sec: 0.2
 
-  ng_signal_duration_sec: 2.0
-  ng_signal_interval_sec: 0.1
+  # Kiem tra COM ngay khi khoi dong, truoc khi load model.
+  # Chi doc thong bao san sang, KHONG gui lenh bat relay.
+  startup_timeout_sec: 8.0
+  ready_message: "Arduino san sang"
+
+  # false: COM loi -> web van chay, /health hien loi, NG sau thu ket noi lai.
+  # true: COM/Arduino chua san sang -> dung khoi dong server.
+  startup_required: false
+
+  # Xac nhan Arduino da xu ly lenh NG (khong phai cam bien trang thai relay).
+  ack_timeout_sec: 3.0
+  ack_message: "NHAN 0 - RELAY KICH HOAT"
+
+  # Gui 1 lenh moi NG; relay giu bat theo logic sketch Arduino.
+  ng_signal_duration_sec: 0.5
+  ng_signal_interval_sec: 0.5
 
 # ============================================================
 # MERGED MODE: webhook Step 1 FAIL gửi về Camera Agent

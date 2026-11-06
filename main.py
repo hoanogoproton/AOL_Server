@@ -1171,179 +1171,322 @@ class InspectionDatabase:
 # ============================================================
 
 class ArduinoSignalSender:
-    """
-    Gửi tín hiệu NG liên tục qua COM.
+    """Open/check Arduino at startup; confirm NG using the existing sketch.
 
-    Mặc định khi Step 3 phát hiện NG:
-    - Gửi b"0\r\n"
-    - Mỗi 0.1 giây gửi 1 lần
-    - Duy trì trong 2 giây
-    - Tổng cộng 20 lần gửi
-
-    Có thể thay đổi bằng config:
-    serial.ng_signal_duration_sec
-    serial.ng_signal_interval_sec
+    Startup reads "Arduino san sang"; it NEVER sends the relay command.
+    No firmware update is needed with the sketch provided by the user.
+    An open COM alone is not a readiness check or a hardware relay check.
     """
 
     NG_SIGNAL = b"0\r\n"
 
     def __init__(self, config: dict):
         self.enabled = bool(config["enabled"])
-        self.port = config["port"]
+        self.port = str(config["port"])
         self.baudrate = int(config["baudrate"])
         self.retry_count = int(config.get("retry_count", 3))
         self.retry_interval_sec = float(config.get("retry_interval_sec", 0.2))
+        self.ng_signal_duration_sec = float(config.get("ng_signal_duration_sec", 0.5))
+        self.ng_signal_interval_sec = float(config.get("ng_signal_interval_sec", 0.5))
+        self.startup_timeout_sec = float(config.get("startup_timeout_sec", 8.0))
+        self.startup_required = bool(config.get("startup_required", False))
+        self.ready_message = str(config.get("ready_message", "Arduino san sang"))
+        self.ack_timeout_sec = float(config.get("ack_timeout_sec", 3.0))
+        self.ack_message = str(config.get("ack_message", "NHAN 0 - RELAY KICH HOAT"))
 
-        # Giá trị mặc định theo yêu cầu: 2 giây, mỗi 0.1 giây một tín hiệu.
-        self.ng_signal_duration_sec = float(
-            config.get("ng_signal_duration_sec", 2.0)
-        )
-        self.ng_signal_interval_sec = float(
-            config.get("ng_signal_interval_sec", 0.1)
-        )
-
-        if self.ng_signal_duration_sec <= 0:
-            raise ValueError("ng_signal_duration_sec phải lớn hơn 0")
-
-        if self.ng_signal_interval_sec <= 0:
-            raise ValueError("ng_signal_interval_sec phải lớn hơn 0")
+        if self.retry_count < 1:
+            raise ValueError("serial.retry_count must be >= 1")
+        if self.retry_interval_sec < 0:
+            raise ValueError("serial.retry_interval_sec must be >= 0")
+        for key in ("ng_signal_duration_sec", "ng_signal_interval_sec",
+                    "startup_timeout_sec", "ack_timeout_sec"):
+            if getattr(self, key) <= 0:
+                raise ValueError("serial.%s must be > 0" % key)
+        if not self.ready_message or not self.ack_message:
+            raise ValueError("Serial ready_message/ack_message must not be empty")
 
         self.serial_conn: Optional[serial.Serial] = None
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
+        # Health reads must not wait for a serial timeout.
+        self.status_lock = threading.Lock()
+        self._rx_buffer = bytearray()
+        self._status = {
+            "enabled": self.enabled,
+            "port": self.port,
+            "baudrate": self.baudrate,
+            "state": "not_checked" if self.enabled else "disabled",
+            "ready": False,
+            "last_error": None,
+            "last_check_at": None,
+            "last_rx": None,
+            "last_ack_at": None,
+            "last_ng_confirmed": None,
+        }
+
+    def _update_status(self, **values) -> None:
+        with self.status_lock:
+            self._status.update(values)
+
+    def get_status(self) -> dict:
+        with self.status_lock:
+            result = dict(self._status)
+        # is_open describes the handle, not physical USB liveness.
+        result["connected"] = self.is_connected()
+        return result
 
     def is_connected(self) -> bool:
-        return bool(
-            self.serial_conn is not None
-            and self.serial_conn.is_open
-        )
+        conn = self.serial_conn
+        return bool(conn is not None and conn.is_open)
+
+    def _close_connection(self) -> None:
+        conn = self.serial_conn
+        self.serial_conn = None
+        self._rx_buffer.clear()
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                LOGGER.exception("Serial close failed: COM=%s", self.port)
+        self._update_status(ready=False)
+
+    def close(self) -> None:
+        with self.lock:
+            self._close_connection()
+            self._update_status(state="closed" if self.enabled else "disabled")
+            LOGGER.info("Serial connection closed: COM=%s", self.port)
+
+    def _read_line(self, deadline: float) -> Optional[str]:
+        """Keep partial lines across serial read timeouts; bound memory."""
+        assert self.serial_conn is not None
+        while time.monotonic() < deadline:
+            newline = self._rx_buffer.find(b"\n")
+            if newline >= 0:
+                raw = bytes(self._rx_buffer[:newline])
+                del self._rx_buffer[:newline + 1]
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                LOGGER.info("Arduino RX [%s]: %s", self.port, line)
+                self._update_status(last_rx=line)
+                return line
+            chunk = self.serial_conn.read(
+                min(max(self.serial_conn.in_waiting, 1), 1024)
+            )
+            if chunk:
+                self._rx_buffer.extend(chunk)
+                if len(self._rx_buffer) > 8192:
+                    raise serial.SerialException(
+                        "Arduino response exceeded 8192 bytes without a line ending"
+                    )
+        return None
+
+    def _check_sensor_error(self, line: str) -> None:
+        if "Khong ket noi duoc cam bien" in line:
+            raise serial.SerialException(
+                "Arduino reports fingerprint sensor failure; sketch is stopped in setup()"
+            )
 
     def ensure_open(self) -> None:
+        # Called under self.lock by initialize() or send_ng_signal().
         if not self.enabled:
             return
-
-        if self.serial_conn is not None and self.serial_conn.is_open:
+        if self.is_connected() and self.get_status()["ready"]:
             return
 
-        LOGGER.info("Opening serial port %s", self.port)
-
-        self.serial_conn = serial.Serial(
-            port=self.port,
-            baudrate=self.baudrate,
-            timeout=0.1,
-            write_timeout=1,
+        self._close_connection()
+        self._update_status(
+            state="connecting", ready=False, last_check_at=utc_now_iso()
         )
-
-        # Mở cổng kéo DTR lên -> Arduino tự reset, chờ bootloader xong.
-        time.sleep(1.5)
-
+        LOGGER.info(
+            "Opening serial port %s baud=%s; waiting for %r (timeout %.1fs)",
+            self.port, self.baudrate, self.ready_message, self.startup_timeout_sec,
+        )
         try:
-            self.serial_conn.reset_input_buffer()
-            self.serial_conn.reset_output_buffer()
-        except Exception:
-            pass
+            self.serial_conn = serial.Serial(
+                port=self.port,
+                baudrate=self.baudrate,
+                timeout=0.1,
+                write_timeout=1,
+            )
+            # Do NOT reset_input_buffer(): it can discard the READY response.
+            # Opening COM can reset Arduino; read its startup output immediately.
+            deadline = time.monotonic() + self.startup_timeout_sec
+            while time.monotonic() < deadline:
+                line = self._read_line(deadline)
+                if line is None:
+                    break
+                self._check_sensor_error(line)
+                if line == self.ready_message:
+                    self._update_status(
+                        state="ready", ready=True, last_error=None,
+                        last_check_at=utc_now_iso(),
+                    )
+                    LOGGER.info(
+                        "COM startup check OK: port=%s baud=%s Arduino READY; "
+                        "no relay command sent",
+                        self.port, self.baudrate,
+                    )
+                    return
+            raise serial.SerialException(
+                "Timeout waiting for Arduino READY on %s. Check baud/firmware/sensor. "
+                "If the board does not auto-reset when opening COM, press RESET "
+                "during this startup check." % self.port
+            )
+        except Exception as ex:
+            self._close_connection()
+            self._update_status(
+                state="error", ready=False, last_error=str(ex),
+                last_check_at=utc_now_iso(),
+            )
+            raise
 
-    def _write_ng_signal_once(self) -> bool:
-        """
-        Gửi một lần b"0\\r\\n", có retry khi COM bị lỗi.
-        Hàm này được gọi bên trong self.lock.
-        """
+    def _open_with_retry(self) -> bool:
         for attempt in range(1, self.retry_count + 1):
             try:
                 self.ensure_open()
-
-                assert self.serial_conn is not None
-
-                self.serial_conn.write(self.NG_SIGNAL)
-                self.serial_conn.flush()
-
                 return True
-
             except Exception as ex:
                 LOGGER.error(
-                    "Serial write failed attempt=%s: %s",
-                    attempt,
-                    ex,
+                    "COM connection/readiness failed attempt=%s/%s COM=%s: %s",
+                    attempt, self.retry_count, self.port, ex,
                 )
-
-                try:
-                    if self.serial_conn is not None:
-                        self.serial_conn.close()
-                except Exception:
-                    pass
-
-                self.serial_conn = None
-
                 if attempt < self.retry_count:
                     time.sleep(self.retry_interval_sec)
-
         return False
 
-    def send_ng_signal(self) -> bool:
-        """
-        Gửi b"0\\r\\n" liên tục trong 2 giây, mặc định 1 lần/0.1 giây.
-
-        Với cấu hình mặc định:
-            2.0 / 0.1 = 20 lần gửi
-
-        Lần đầu được gửi ngay lập tức. Các lần sau được căn theo
-        time.monotonic() để hạn chế sai lệch do thời gian write/flush.
-        """
+    def initialize(self) -> bool:
+        """Run once before loading models or starting camera/inspection workers."""
         if not self.enabled:
-            LOGGER.warning("Serial disabled. Skip NG signal (simulate sent).")
+            LOGGER.warning("Serial disabled; startup COM check skipped")
             return True
+        from serial.tools import list_ports
+        try:
+            ports = list(list_ports.comports())
+            LOGGER.info(
+                "Available serial ports: %s",
+                "; ".join("%s (%s)" % (p.device, p.description) for p in ports)
+                or "(none)",
+            )
+        except Exception:
+            LOGGER.exception("Unable to enumerate ports; still trying configured COM")
 
         with self.lock:
-            # Làm tròn lên để bảo đảm đủ số lần theo khoảng thời gian yêu cầu.
-            signal_count = max(
-                1,
-                int(
-                    round(
-                        self.ng_signal_duration_sec
-                        / self.ng_signal_interval_sec
-                    )
-                ),
+            ok = self._open_with_retry()
+        if not ok:
+            LOGGER.critical(
+                "COM STARTUP CHECK FAILED: %s. Close AOL/testcom/Serial Monitor "
+                "using this port, check USB and Device Manager. Detail: %s",
+                self.port, self.get_status()["last_error"],
             )
-
-            LOGGER.warning(
-                "Start NG signal burst: port=%s duration=%.3fs "
-                "interval=%.3fs count=%s",
-                self.port,
-                self.ng_signal_duration_sec,
-                self.ng_signal_interval_sec,
-                signal_count,
-            )
-
-            start_time = time.monotonic()
-            sent_count = 0
-
-            for index in range(signal_count):
-                target_time = (
-                    start_time + index * self.ng_signal_interval_sec
+            if self.startup_required:
+                raise RuntimeError(
+                    "Required Arduino startup check failed: %s" % self.port
                 )
+            LOGGER.warning(
+                "Server will continue with serial NOT READY; /health reports the "
+                "error. A later NG will retry the connection. No NG is simulated."
+            )
+        return ok
 
-                # Chờ đến đúng mốc gửi, trừ lần đầu gửi ngay.
-                wait_sec = target_time - time.monotonic()
+    def _write_ng_signal_once(self) -> bool:
+        # Only connection/readiness is retried. Once a command may have reached
+        # Arduino, never resend automatically just because its ACK was lost.
+        if not self._open_with_retry():
+            self._update_status(last_ng_confirmed=False)
+            return False
+        assert self.serial_conn is not None
+        try:
+            # Consume pending old output before a NEW command; don't discard logs.
+            drain_deadline = time.monotonic() + 0.2
+            while (self._rx_buffer or self.serial_conn.in_waiting) and (
+                time.monotonic() < drain_deadline
+            ):
+                old_line = self._read_line(drain_deadline)
+                if old_line is not None:
+                    self._check_sensor_error(old_line)
+
+            written = self.serial_conn.write(self.NG_SIGNAL)
+            self.serial_conn.flush()
+            if written != len(self.NG_SIGNAL):
+                raise serial.SerialException(
+                    "Partial serial write: %s/%s bytes" % (written, len(self.NG_SIGNAL))
+                )
+            LOGGER.info("Arduino TX [%s]: %r (%s bytes)", self.port, self.NG_SIGNAL, written)
+            deadline = time.monotonic() + self.ack_timeout_sec
+            while time.monotonic() < deadline:
+                line = self._read_line(deadline)
+                if line is None:
+                    break
+                self._check_sensor_error(line)
+                if line == self.ack_message:
+                    self._update_status(
+                        state="ready", last_error=None, last_ack_at=utc_now_iso(),
+                        last_ng_confirmed=True,
+                    )
+                    LOGGER.warning("NG confirmed by Arduino ACK: COM=%s", self.port)
+                    return True
+
+            message = (
+                "NG written but Arduino ACK was NOT received in %.1fs; "
+                "relay state is UNKNOWN; not automatically resending"
+                % self.ack_timeout_sec
+            )
+            self._update_status(
+                state="ack_timeout", last_error=message, last_ng_confirmed=False
+            )
+            LOGGER.error("%s COM=%s", message, self.port)
+            return False
+        except Exception as ex:
+            # Write/flush may have succeeded partially: do not blindly replay.
+            self._close_connection()
+            self._update_status(
+                state="error", last_error=str(ex), last_ng_confirmed=False
+            )
+            LOGGER.error(
+                "NG communication failed; delivery/relay state may be unknown; "
+                "no automatic replay. COM=%s: %s", self.port, ex,
+            )
+            return False
+
+    def send_ng_signal(self) -> bool:
+        if not self.enabled:
+            LOGGER.warning("Serial disabled; NG NOT sent or confirmed")
+            self._update_status(last_ng_confirmed=False)
+            return False
+
+        with self.lock:
+            signal_count = max(1, int(round(
+                self.ng_signal_duration_sec / self.ng_signal_interval_sec
+            )))
+            LOGGER.warning(
+                "Start NG signal burst: port=%s duration=%.3fs interval=%.3fs count=%s",
+                self.port, self.ng_signal_duration_sec,
+                self.ng_signal_interval_sec, signal_count,
+            )
+            if signal_count > 1:
+                LOGGER.warning(
+                    "Repeated NG commands can re-enable relay after fingerprint "
+                    "turns it off. Use duration=interval for a single command."
+                )
+            start_time = time.monotonic()
+            confirmed_count = 0
+            for index in range(signal_count):
+                wait_sec = (
+                    start_time + index * self.ng_signal_interval_sec
+                    - time.monotonic()
+                )
                 if wait_sec > 0:
                     time.sleep(wait_sec)
-
                 if not self._write_ng_signal_once():
                     LOGGER.error(
-                        "NG signal burst stopped at %s/%s. COM=%s",
-                        sent_count,
-                        signal_count,
-                        self.port,
+                        "NG signal burst NOT fully confirmed: confirmed=%s/%s COM=%s",
+                        confirmed_count, signal_count, self.port,
                     )
                     return False
-
-                sent_count += 1
-
-            elapsed = time.monotonic() - start_time
-
+                confirmed_count += 1
             LOGGER.warning(
-                "NG signal burst completed: sent=%s duration=%.3fs COM=%s",
-                sent_count,
-                elapsed,
-                self.port,
+                "NG signal burst completed: confirmed=%s duration=%.3fs COM=%s",
+                confirmed_count, time.monotonic() - start_time, self.port,
             )
             return True
 
@@ -1356,7 +1499,7 @@ class InspectionService:
     # Chu ky chay thread don dep anh cu (30 phut / lan).
     RETENTION_CHECK_INTERVAL_SEC = 1800
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, signal_sender=None):
         self.config = config
 
         self.raw_dir = Path(config["storage"]["raw_dir"])
@@ -1416,8 +1559,9 @@ class InspectionService:
             config["roi"]["csv_path"]
         )
 
-        self.signal_sender = ArduinoSignalSender(
-            config["serial"]
+        self.signal_sender = (
+            signal_sender if signal_sender is not None
+            else ArduinoSignalSender(config["serial"])
         )
 
         self.classifier_models: dict[str, YOLO] = {}
@@ -1989,7 +2133,12 @@ class InspectionService:
                 self.save_ng_screenshot(annotated_path, event)
 
                 if step == 3:
-                    self.signal_sender.send_ng_signal()
+                    if not self.signal_sender.send_ng_signal():
+                        LOGGER.critical(
+                            "STEP3 NG NOT CONFIRMED by Arduino: event=%s cycle=%s "
+                            "COM=%s. Check relay/COM; inspection result remains NG.",
+                            event_id, event["cycle_id"], self.signal_sender.port,
+                        )
 
             result_payload = {
                 "event_id": event_id,
@@ -2225,17 +2374,27 @@ def stop_camera_agent() -> None:
 async def lifespan(app: FastAPI):
     global service
 
-    service = InspectionService(CONFIG)
-    service.start()
-
-    start_camera_agent()
-
-    yield
-
-    stop_camera_agent()
-
-    if service:
-        service.stop()
+    service = None
+    sender = ArduinoSignalSender(CONFIG["serial"])
+    LOGGER.info("Active configuration: %s", Path(CONFIG_PATH).resolve())
+    try:
+        # Check COM first, before loading models or starting inspection workers.
+        # This only reads Arduino startup messages; NEVER sends b"0\\r\\n".
+        sender.initialize()
+        service = InspectionService(CONFIG, signal_sender=sender)
+        service.start()
+        start_camera_agent()
+        yield
+    finally:
+        try:
+            stop_camera_agent()
+        finally:
+            try:
+                if service is not None:
+                    service.stop()
+            finally:
+                sender.close()
+                service = None
 
 
 app = FastAPI(
@@ -2263,6 +2422,8 @@ def health():
         "model_paths": model_paths,
         "serial_enabled": CONFIG["serial"]["enabled"],
         "serial_connected": service.signal_sender.is_connected(),
+        "serial_ready": service.signal_sender.get_status()["ready"],
+        "serial": service.signal_sender.get_status(),
         "queue_size": service.job_queue.qsize(),
         "client_url": f"http://{CONFIG['client']['host']}:{CONFIG['client']['port']}",
         "camera_agent": (
